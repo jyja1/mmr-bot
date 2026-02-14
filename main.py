@@ -12,8 +12,19 @@ app = FastAPI()
 cache_text = None
 cache_time = 0
 
+RANKS = {
+    1: "Herald",
+    2: "Guardian",
+    3: "Crusader",
+    4: "Archon",
+    5: "Legend",
+    6: "Ancient",
+    7: "Divine",
+    8: "Immortal"
+}
+
 @app.get("/mmr", response_class=PlainTextResponse)
-async def get_mmr():
+async def get_rank():
     global cache_text, cache_time
 
     if not ACCOUNT_ID:
@@ -29,12 +40,15 @@ async def get_mmr():
         response = await client.get(url)
         data = response.json()
 
-    mmr = data.get("mmr_estimate", {}).get("estimate")
+    rank_tier = data.get("rank_tier")
 
-    if not mmr:
-        result = "MMR не найден (возможно профиль приватный)"
+    if not rank_tier:
+        result = "Ранг не найден"
     else:
-        result = f"Мой текущий MMR: {mmr}"
+        tier = int(str(rank_tier)[0])
+        star = int(str(rank_tier)[1])
+        rank_name = RANKS.get(tier, "Unknown")
+        result = f"Мой ранг: {rank_name} {star}"
 
     cache_text = result
     cache_time = now
