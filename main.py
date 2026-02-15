@@ -87,7 +87,7 @@ async def mmr():
         return _cache_text
 
     if not UPSTASH_URL or not UPSTASH_TOKEN:
-        return "Redis не настроен"
+    return f"Redis не настроен: URL={'OK' if UPSTASH_URL else 'MISSING'} TOKEN={'OK' if UPSTASH_TOKEN else 'MISSING'}"
 
     state_key = f"mmr:{ACCOUNT_ID}"
     state = await redis_get(state_key)
