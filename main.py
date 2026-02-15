@@ -471,3 +471,23 @@ async def eventsub_setup(request: Request, token: str = Query(default="")):
         f"callback: {callback_url}\n"
         f"created: stream.online + stream.offline\n"
     )
+
+@app.get("/streamstatus", response_class=PlainTextResponse)
+async def streamstatus(token: str = Query(default="")):
+    err = require_admin(token)
+    if err:
+        return err
+
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await redis_get_json(state_key)
+    if not state:
+        return "State not initialized"
+
+    return (
+        f"stream_active={state.get('stream_active')}\n"
+        f"stream_start_time={state.get('stream_start_time')}\n"
+        f"stream_win={state.get('stream_win')}\n"
+        f"stream_lose={state.get('stream_lose')}\n"
+        f"stream_delta={state.get('stream_delta')}\n"
+        f"mmr={state.get('mmr')}\n"
+    )
