@@ -195,44 +195,63 @@ async def mmr():
     return text
 
 @app.get("/testwin", response_class=PlainTextResponse)
-async def test_win(token: str = Query("")):
+async def testwin(token: str = Query("")):
     if token != ADMIN_TOKEN:
         return "Forbidden"
-    # дальше твой код без изменений
 
-@app.get("/testwin", response_class=PlainTextResponse)
-async def test_win():
     state_key = f"mmr:{ACCOUNT_ID}"
     state = await redis_get_json(state_key)
     if not state:
-        return "State not initialized"
+        baseline = await fetch_latest_ranked_start_time()
+        state = default_state(baseline)
 
-    state["mmr"] += MMR_STEP
-    state["today_win"] += 1
-    state["today_delta"] += MMR_STEP
+    # если день сменился — сбрасываем daily
+    if state.get("today_date") != today_key():
+        state["today_date"] = today_key()
+        state["today_win"] = 0
+        state["today_lose"] = 0
+        state["today_delta"] = 0
+
+    state["mmr"] = int(state.get("mmr", START_MMR)) + MMR_STEP
+    state["today_win"] = int(state.get("today_win", 0)) + 1
+    state["today_delta"] = int(state.get("today_delta", 0)) + MMR_STEP
 
     await redis_set_json(state_key, state)
+
+    global _cache_text, _cache_ts
+    _cache_text = None
+    _cache_ts = 0
 
     return "WIN added"
 
-@app.get("/testlose", response_class=PlainTextResponse)
-async def test_lose(token: str = Query("")):
-    if token != ADMIN_TOKEN:
-        return "Forbidden"
-    # дальше твой код без изменений
 
 @app.get("/testlose", response_class=PlainTextResponse)
-async def test_lose():
+async def testlose(token: str = Query("")):
+    if token != ADMIN_TOKEN:
+        return "Forbidden"
+
     state_key = f"mmr:{ACCOUNT_ID}"
     state = await redis_get_json(state_key)
     if not state:
-        return "State not initialized"
+        baseline = await fetch_latest_ranked_start_time()
+        state = default_state(baseline)
 
-    state["mmr"] -= MMR_STEP
-    state["today_lose"] += 1
-    state["today_delta"] -= MMR_STEP
+    # если день сменился — сбрасываем daily
+    if state.get("today_date") != today_key():
+        state["today_date"] = today_key()
+        state["today_win"] = 0
+        state["today_lose"] = 0
+        state["today_delta"] = 0
+
+    state["mmr"] = int(state.get("mmr", START_MMR)) - MMR_STEP
+    state["today_lose"] = int(state.get("today_lose", 0)) + 1
+    state["today_delta"] = int(state.get("today_delta", 0)) - MMR_STEP
 
     await redis_set_json(state_key, state)
+
+    global _cache_text, _cache_ts
+    _cache_text = None
+    _cache_ts = 0
 
     return "LOSE added"
 
