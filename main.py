@@ -353,6 +353,28 @@ async def reset_stream(token: str = Query(default="")):
     clear_cache()
     return "Stream counters reset"
 
+@app.get("/force_stream_start", response_class=PlainTextResponse)
+async def force_stream_start(token: str = Query(default=""), minutes: int = Query(default=360)):
+    err = require_admin(token)
+    if err:
+        return err
+
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await redis_get_json(state_key) or default_state(int(time.time()))
+    state = ensure_state_fields(state)
+
+    now_ts = int(time.time())
+    baseline = now_ts - int(minutes) * 60  # считаем “стрим” как будто начался minutes минут назад
+
+    state["stream_active"] = True
+    state["stream_start_time"] = baseline
+    state["stream_win"] = 0
+    state["stream_lose"] = 0
+    state["stream_delta"] = 0
+
+    await redis_set_json(state_key, state)
+    clear_cache()
+    return f"OK stream forced. start_time={baseline}"
 
 # ========= EVENTSUB (Twitch) =========
 def verify_eventsub_signature(req: Request, body: bytes) -> bool:
