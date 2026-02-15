@@ -526,3 +526,27 @@ async def eventsub_setup(request: Request, token: str = Query(default="")):
         f"online: {online.get('status', 'created')}\n"
         f"offline: {offline.get('status', 'created')}\n"
     )
+
+@app.get("/backfill", response_class=PlainTextResponse)
+async def backfill(token: str = Query(default=""), minutes: int = Query(default=720)):
+    err = require_admin(token)
+    if err:
+        return err
+
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await redis_get_json(state_key)
+    if not state:
+        return "State not initialized"
+
+    state = ensure_state_fields(state)
+
+    now_ts = int(time.time())
+    baseline = now_ts - int(minutes) * 60
+
+    # сдвигаем окно назад и очищаем processed, чтобы точно подтянуло матчи
+    state["last_start_time"] = min(int(state.get("last_start_time", baseline)), baseline)
+    state["processed_ids"] = []
+
+    await redis_set_json(state_key, state)
+    clear_cache()
+    return f"OK backfill armed from {baseline}. Call /mmr now."
