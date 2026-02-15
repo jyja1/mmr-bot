@@ -171,9 +171,11 @@ def soft_reset_state_keep_mmr(old_state: dict, baseline_start_time: int) -> dict
 
 
 # -------------------- endpoints --------------------
-@app.get("/health", response_class=PlainTextResponse)
+from fastapi.responses import PlainTextResponse
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    return "ok"
+    return PlainTextResponse("ok")
 
 
 @app.get("/mmr", response_class=PlainTextResponse)
