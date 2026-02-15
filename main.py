@@ -3,15 +3,15 @@ import json
 import time
 import hmac
 import hashlib
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Any, Dict, List, Set
+from datetime import timedelta, timezone
+from typing import Optional, List, Set
 
 import httpx
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import PlainTextResponse
 
 # ========= ENV =========
-ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")  # 32-bit steam account id for dota
+ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")  # 32-bit steam account id
 STEAM_API_KEY = os.environ.get("STEAM_API_KEY")
 
 START_MMR = int(os.environ.get("START_MMR", "13772"))
@@ -32,7 +32,7 @@ EVENTSUB_SECRET = os.environ.get("EVENTSUB_SECRET")
 # если ты начал игру чуть раньше уведомления stream.online
 STREAM_LOOKBACK_MIN = int(os.environ.get("STREAM_LOOKBACK_MIN", "120"))
 
-CACHE_TTL = 10  # секунды кеша для /mmr
+CACHE_TTL = 10  # сек кеша для /mmr
 
 STEAM_MATCH_HISTORY = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/V001/"
 STEAM_MATCH_DETAILS = "https://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/V001/"
@@ -98,11 +98,9 @@ def default_state(now_ts: int) -> dict:
         "start_mmr": START_MMR,
         "mmr": START_MMR,
 
-        # матч-сканер
         "last_start_time": now_ts,   # не считаем “старые” матчи до запуска
-        "processed_ids": [],         # match_id, чтобы не считать повторно
+        "processed_ids": [],
 
-        # сессия стрима
         "stream_active": False,
         "stream_start_time": 0,
         "stream_win": 0,
@@ -111,16 +109,31 @@ def default_state(now_ts: int) -> dict:
     }
 
 
+def ensure_state_fields(state: dict) -> dict:
+    """
+    Миграция состояния: если раньше state создавался без полей stream_*,
+    мы добавляем их, не трогая текущий mmr.
+    """
+    state.setdefault("start_mmr", START_MMR)
+    state.setdefault("mmr", START_MMR)
+
+    state.setdefault("last_start_time", int(time.time()))
+    state.setdefault("processed_ids", [])
+
+    state.setdefault("stream_active", False)
+    state.setdefault("stream_start_time", 0)
+    state.setdefault("stream_win", 0)
+    state.setdefault("stream_lose", 0)
+    state.setdefault("stream_delta", 0)
+    return state
+
+
 def is_win_for_player(radiant_win: bool, player_slot: int) -> bool:
     is_radiant = int(player_slot) < 128
     return bool(radiant_win) if is_radiant else (not bool(radiant_win))
 
 
 async def steam_get_ranked_matches(limit: int = 30) -> List[dict]:
-    """
-    Возвращает список матчей (history) для account_id.
-    В matchhistory нет победителя -> победителя берём через GetMatchDetails.
-    """
     params = {
         "key": STEAM_API_KEY,
         "account_id": int(ACCOUNT_ID),
@@ -130,10 +143,11 @@ async def steam_get_ranked_matches(limit: int = 30) -> List[dict]:
         r = await client.get(STEAM_MATCH_HISTORY, params=params)
         r.raise_for_status()
         data = r.json()
+
     result = data.get("result", {}) or {}
     matches = result.get("matches", []) or []
 
-    # фильтруем только ranked: lobby_type == 7 (как ты и хотел)
+    # ranked only: lobby_type == 7
     ranked = [m for m in matches if int(m.get("lobby_type", -1)) == 7]
     return ranked
 
@@ -144,7 +158,7 @@ async def steam_get_match_details(match_id: int) -> Optional[dict]:
         r = await client.get(STEAM_MATCH_DETAILS, params=params)
         r.raise_for_status()
         data = r.json()
-    return (data.get("result") or None)
+    return data.get("result") or None
 
 
 def find_player_slot(details: dict, account_id: int) -> Optional[int]:
@@ -154,7 +168,7 @@ def find_player_slot(details: dict, account_id: int) -> Optional[int]:
     return None
 
 
-# ========= HEALTH (для UptimeRobot HEAD-only) =========
+# ========= HEALTH (для UptimeRobot на бесплатном: HEAD-only) =========
 @app.api_route("/health", methods=["GET", "HEAD"], response_class=PlainTextResponse)
 async def health():
     return "ok"
@@ -178,17 +192,18 @@ async def mmr():
 
     state_key = f"mmr:{ACCOUNT_ID}"
     state = await redis_get_json(state_key)
+
     if not state:
         state = default_state(int(time.time()))
         await redis_set_json(state_key, state)
 
+    state = ensure_state_fields(state)
+
     processed: Set[int] = set(int(x) for x in (state.get("processed_ids") or []))
     last_time = int(state.get("last_start_time", 0))
 
-    # берём ranked матчи
     matches = await steam_get_ranked_matches(limit=30)
 
-    # выбираем новые (по start_time) и не обработанные
     new_matches = []
     for m in matches:
         mid = m.get("match_id")
@@ -202,7 +217,6 @@ async def mmr():
 
     new_matches.sort(key=lambda x: int(x.get("start_time", 0)))
 
-    # применяем изменения
     for m in new_matches:
         mid = int(m["match_id"])
         st = int(m["start_time"])
@@ -225,7 +239,7 @@ async def mmr():
         # общий mmr всегда копится
         state["mmr"] = int(state.get("mmr", START_MMR)) + delta
 
-        # учитываем “Today” ТОЛЬКО если стрим активен и матч после старта стрима
+        # “Today” = только за текущий стрим
         if state.get("stream_active") and st >= int(state.get("stream_start_time", 0)):
             if won:
                 state["stream_win"] = int(state.get("stream_win", 0)) + 1
@@ -249,7 +263,31 @@ async def mmr():
     return text
 
 
-# ========= ADMIN DEBUG/TEST =========
+# ========= ADMIN DEBUG / CONTROL =========
+@app.get("/streamstatus", response_class=PlainTextResponse)
+async def streamstatus(token: str = Query(default="")):
+    err = require_admin(token)
+    if err:
+        return err
+
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await redis_get_json(state_key)
+    if not state:
+        return "State not initialized"
+
+    state = ensure_state_fields(state)
+    await redis_set_json(state_key, state)
+
+    return (
+        f"stream_active={state.get('stream_active')}\n"
+        f"stream_start_time={state.get('stream_start_time')}\n"
+        f"stream_win={state.get('stream_win')}\n"
+        f"stream_lose={state.get('stream_lose')}\n"
+        f"stream_delta={state.get('stream_delta')}\n"
+        f"mmr={state.get('mmr')}\n"
+    )
+
+
 @app.get("/testwin", response_class=PlainTextResponse)
 async def testwin(token: str = Query(default="")):
     err = require_admin(token)
@@ -260,6 +298,8 @@ async def testwin(token: str = Query(default="")):
     state = await redis_get_json(state_key)
     if not state:
         return "State not initialized"
+
+    state = ensure_state_fields(state)
 
     state["mmr"] = int(state.get("mmr", START_MMR)) + MMR_STEP
     state["stream_win"] = int(state.get("stream_win", 0)) + 1
@@ -281,6 +321,8 @@ async def testlose(token: str = Query(default="")):
     if not state:
         return "State not initialized"
 
+    state = ensure_state_fields(state)
+
     state["mmr"] = int(state.get("mmr", START_MMR)) - MMR_STEP
     state["stream_lose"] = int(state.get("stream_lose", 0)) + 1
     state["stream_delta"] = int(state.get("stream_delta", 0)) - MMR_STEP
@@ -293,16 +335,15 @@ async def testlose(token: str = Query(default="")):
 @app.get("/reset_stream", response_class=PlainTextResponse)
 async def reset_stream(token: str = Query(default="")):
     """
-    Обнуляет Today/Win/Lose/Total (стримовые), НО НЕ трогает общий MMR.
+    Обнуляет Today/Win/Lose/Total (стримовые), НЕ трогает общий mmr.
     """
     err = require_admin(token)
     if err:
         return err
 
     state_key = f"mmr:{ACCOUNT_ID}"
-    state = await redis_get_json(state_key)
-    if not state:
-        state = default_state(int(time.time()))
+    state = await redis_get_json(state_key) or default_state(int(time.time()))
+    state = ensure_state_fields(state)
 
     state["stream_win"] = 0
     state["stream_lose"] = 0
@@ -314,11 +355,7 @@ async def reset_stream(token: str = Query(default="")):
 
 
 # ========= EVENTSUB (Twitch) =========
-
 def verify_eventsub_signature(req: Request, body: bytes) -> bool:
-    """
-    Проверка HMAC подписи Twitch EventSub.
-    """
     if not EVENTSUB_SECRET:
         return False
 
@@ -338,42 +375,41 @@ def verify_eventsub_signature(req: Request, body: bytes) -> bool:
 @app.post("/eventsub")
 async def eventsub(request: Request):
     body = await request.body()
-    # подпись обязана совпасть
+
     if not verify_eventsub_signature(request, body):
         return PlainTextResponse("invalid signature", status_code=403)
 
     payload = json.loads(body.decode("utf-8"))
     msg_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
 
-    # 1) challenge (подтверждение webhook)
+    # verification challenge
     if msg_type == "webhook_callback_verification":
         challenge = payload.get("challenge", "")
         return PlainTextResponse(challenge)
 
-    # 2) notifications
+    # notifications
     if msg_type == "notification":
         sub = payload.get("subscription") or {}
-        event = payload.get("event") or {}
         sub_type = sub.get("type")
 
         state_key = f"mmr:{ACCOUNT_ID}"
-        state = await redis_get_json(state_key)
-        if not state:
-            state = default_state(int(time.time()))
+        state = await redis_get_json(state_key) or default_state(int(time.time()))
+        state = ensure_state_fields(state)
 
         now_ts = int(time.time())
+
         if sub_type == "stream.online":
-            # старт сессии: обнуляем стримовые счётчики, общий mmr не трогаем
             baseline = now_ts - STREAM_LOOKBACK_MIN * 60
+
             state["stream_active"] = True
             state["stream_start_time"] = baseline
             state["stream_win"] = 0
             state["stream_lose"] = 0
             state["stream_delta"] = 0
 
-            # чтобы не засчитать старое до старта стрима
+            # чтобы не прихватить старое
             state["last_start_time"] = max(int(state.get("last_start_time", 0)), baseline)
-            state["processed_ids"] = []  # сбрасываем, чтобы не мешал прошлый стрим
+            state["processed_ids"] = []
 
             await redis_set_json(state_key, state)
             clear_cache()
@@ -385,10 +421,7 @@ async def eventsub(request: Request):
 
         return PlainTextResponse("ok")
 
-    # 3) revocation
-    if msg_type == "revocation":
-        return PlainTextResponse("ok")
-
+    # revocation / anything else
     return PlainTextResponse("ok")
 
 
@@ -406,10 +439,7 @@ async def twitch_app_token() -> str:
 
 
 async def twitch_get_user_id(login: str, token: str) -> str:
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Client-Id": TWITCH_CLIENT_ID,
-    }
+    headers = {"Authorization": f"Bearer {token}", "Client-Id": TWITCH_CLIENT_ID}
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{TWITCH_HELIX}/users", headers=headers, params={"login": login})
         r.raise_for_status()
@@ -430,15 +460,19 @@ async def twitch_create_subscription(sub_type: str, broadcaster_id: str, callbac
         "type": sub_type,
         "version": "1",
         "condition": {"broadcaster_user_id": broadcaster_id},
-        "transport": {
-            "method": "webhook",
-            "callback": callback_url,
-            "secret": EVENTSUB_SECRET,
-        },
+        "transport": {"method": "webhook", "callback": callback_url, "secret": EVENTSUB_SECRET},
     }
+
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(f"{TWITCH_HELIX}/eventsub/subscriptions", headers=headers, json=payload)
-        r.raise_for_status()
+
+        # если уже существует — не падаем
+        if r.status_code == 409:
+            return {"status": "exists"}
+
+        if r.status_code >= 400:
+            return {"status": "error", "code": r.status_code, "body": r.text}
+
         return r.json()
 
 
@@ -447,8 +481,6 @@ async def eventsub_setup(request: Request, token: str = Query(default="")):
     """
     Один раз открыть:
     https://mmr-bot.onrender.com/eventsub_setup?token=ADMIN_TOKEN
-
-    Создаст 2 подписки: stream.online и stream.offline
     """
     err = require_admin(token)
     if err:
@@ -460,7 +492,7 @@ async def eventsub_setup(request: Request, token: str = Query(default="")):
     app_token = await twitch_app_token()
     broadcaster_id = await twitch_get_user_id(TWITCH_BROADCASTER_LOGIN, app_token)
 
-    base = str(request.base_url).rstrip("/")  # https://mmr-bot.onrendered.com
+    base = str(request.base_url).rstrip("/")
     callback_url = f"{base}/eventsub"
 
     online = await twitch_create_subscription("stream.online", broadcaster_id, callback_url, app_token)
@@ -469,25 +501,6 @@ async def eventsub_setup(request: Request, token: str = Query(default="")):
     return PlainTextResponse(
         "OK\n"
         f"callback: {callback_url}\n"
-        f"created: stream.online + stream.offline\n"
-    )
-
-@app.get("/streamstatus", response_class=PlainTextResponse)
-async def streamstatus(token: str = Query(default="")):
-    err = require_admin(token)
-    if err:
-        return err
-
-    state_key = f"mmr:{ACCOUNT_ID}"
-    state = await redis_get_json(state_key)
-    if not state:
-        return "State not initialized"
-
-    return (
-        f"stream_active={state.get('stream_active')}\n"
-        f"stream_start_time={state.get('stream_start_time')}\n"
-        f"stream_win={state.get('stream_win')}\n"
-        f"stream_lose={state.get('stream_lose')}\n"
-        f"stream_delta={state.get('stream_delta')}\n"
-        f"mmr={state.get('mmr')}\n"
+        f"online: {online.get('status', 'created')}\n"
+        f"offline: {offline.get('status', 'created')}\n"
     )
