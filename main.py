@@ -190,3 +190,34 @@ async def mmr():
     text = f"MMR: {cur} • Today -> Win: {tw} Lose: {tl} • Total: {fmt_signed(td)}"
     _cache_text, _cache_ts = text, now
     return text
+
+@app.get("/testwin", response_class=PlainTextResponse)
+async def test_win():
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await redis_get_json(state_key)
+    if not state:
+        return "State not initialized"
+
+    state["mmr"] += MMR_STEP
+    state["today_win"] += 1
+    state["today_delta"] += MMR_STEP
+
+    await redis_set_json(state_key, state)
+
+    return "WIN added"
+
+
+@app.get("/testlose", response_class=PlainTextResponse)
+async def test_lose():
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await redis_get_json(state_key)
+    if not state:
+        return "State not initialized"
+
+    state["mmr"] -= MMR_STEP
+    state["today_lose"] += 1
+    state["today_delta"] -= MMR_STEP
+
+    await redis_set_json(state_key, state)
+
+    return "LOSE added"
