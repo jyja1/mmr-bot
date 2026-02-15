@@ -221,3 +221,14 @@ async def test_lose():
     await redis_set_json(state_key, state)
 
     return "LOSE added"
+
+@app.get("/reset", response_class=PlainTextResponse)
+async def reset_state():
+    state_key = f"mmr:{ACCOUNT_ID}"
+
+    baseline = await fetch_latest_ranked_start_time()
+    state = default_state(baseline)
+
+    await redis_set_json(state_key, state)
+
+    return "State reset"
