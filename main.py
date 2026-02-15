@@ -3,77 +3,119 @@ import json
 import time
 import hmac
 import hashlib
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import PlainTextResponse
 
-# =========================
-# ENV
-# =========================
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
-DOTA_ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID", "").strip()
+# -----------------------
+# ENV
+# -----------------------
+ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")  # 32-bit dota account id (например 1258333388)
 START_MMR = int(os.environ.get("START_MMR", "13772"))
 MMR_STEP = int(os.environ.get("MMR_STEP", "25"))
-TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip()
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "").strip()
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "").strip()
-TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "").strip()
-TWITCH_BROADCASTER_LOGIN = os.environ.get("TWITCH_BROADCASTER_LOGIN", "").strip()
-EVENTSUB_SECRET = os.environ.get("EVENTSUB_SECRET", "").strip()
+STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "")
 
-# IMPORTANT: base URL должен совпадать с твоим доменом на Render
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "https://mmr-bot.onrender.com").strip()
+TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
+TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
+TWITCH_BROADCASTER_LOGIN = os.environ.get("TWITCH_BROADCASTER_LOGIN", "")  # debustie
+EVENTSUB_SECRET = os.environ.get("EVENTSUB_SECRET", "")
 
-# =========================
+# Render public base URL, если не задан — используем домен сервиса
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://mmr-bot.onrender.com").rstrip("/")
+
+# -----------------------
 # CONST
-# =========================
-STEAM_MATCH_HISTORY = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/v1/"
-STEAM_MATCH_DETAILS = "https://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/v1/"
+# -----------------------
+VALVE_HISTORY_URL = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/v1/"
+VALVE_DETAILS_URL = "https://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/v1/"
 
-TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
-TWITCH_HELIX = "https://api.twitch.tv/helix/eventsub/subscriptions"
-TWITCH_USERS = "https://api.twitch.tv/helix/users"
+CACHE_TTL = 10  # сек, чтобы фоссабот не долбил Valve слишком часто
 
-CACHE_TTL = 5  # секунд (не ставь 15-60, иначе в чате будет казаться "не меняется")
+# Retry policy for match details
+DETAILS_MAX_ATTEMPTS = 12
+DETAILS_BACKOFF_BASE = 20  # сек
+DETAILS_BACKOFF_MAX = 10 * 60  # 10 минут
 
+# Limit memory
+MAX_PROCESSED_STREAM = 500
+MAX_PENDING = 200
+MAX_ERRORS = 30
+
+
+# -----------------------
+# APP
+# -----------------------
 app = FastAPI()
-
-_cache_text = None
-_cache_ts = 0
-
-# для дебага ошибок (пишем в state)
-MAX_ERRORS = 40
+_cache_text: Optional[str] = None
+_cache_ts: float = 0.0
 
 
-# =========================
-# TIME / FORMAT
-# =========================
-def tz_msk():
-    return timezone(timedelta(hours=TZ_OFFSET_HOURS))
-
-
+# -----------------------
+# HELPERS
+# -----------------------
 def fmt_signed(n: int) -> str:
     return f"+{n}" if n >= 0 else str(n)
 
 
-def now_unix() -> int:
+def now_ts() -> int:
     return int(time.time())
 
 
-# =========================
-# REDIS (Upstash REST)
-# =========================
-async def redis_get_json(key: str) -> Optional[dict]:
-    async with httpx.AsyncClient(timeout=10) as client:
+def admin_guard(token: str) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN not set on server")
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def state_key() -> str:
+    # один аккаунт
+    return f"mmr:{ACCOUNT_ID}"
+
+
+def default_state() -> Dict[str, Any]:
+    return {
+        "version": 3,
+
+        # MMR global
+        "mmr": START_MMR,
+
+        # Stream mode (today = current stream)
+        "stream_active": False,
+        "stream_start_time": 0,     # unix seconds
+        "stream_win": 0,
+        "stream_lose": 0,
+        "stream_delta": 0,
+
+        # Track processed matches for THIS stream only
+        "processed_ids_stream": [],  # list[int]
+
+        # Pending matches awaiting details
+        # pending[match_id] = { "start_time": int, "attempts": int, "next_try": int }
+        "pending": {},
+
+        # Debug last errors
+        "last_errors": [],  # list[str]
+    }
+
+
+def push_error(st: Dict[str, Any], msg: str) -> None:
+    errs = st.get("last_errors", [])
+    errs.append(msg)
+    st["last_errors"] = errs[-MAX_ERRORS:]
+
+
+async def redis_get_json(key: str) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
             f"{UPSTASH_URL}/get/{key}",
             headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
@@ -89,8 +131,8 @@ async def redis_get_json(key: str) -> Optional[dict]:
             return None
 
 
-async def redis_set_json(key: str, obj: dict):
-    async with httpx.AsyncClient(timeout=10) as client:
+async def redis_set_json(key: str, obj: Dict[str, Any]) -> None:
+    async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             f"{UPSTASH_URL}/set/{key}",
             headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
@@ -99,264 +141,359 @@ async def redis_set_json(key: str, obj: dict):
         r.raise_for_status()
 
 
-# =========================
-# STATE
-# =========================
-def default_state() -> dict:
-    return {
-        "start_mmr": START_MMR,
-        "mmr": START_MMR,
-
-        # stream session stats
-        "stream_active": False,
-        "stream_start_time": 0,      # unix
-        "stream_win": 0,
-        "stream_lose": 0,
-        "stream_delta": 0,
-
-        # processed match ids (for stream only)
-        "processed_ids_stream": [],
-
-        # debug
-        "last_errors": [],
-    }
-
-
-def push_error(state: dict, msg: str):
-    arr = state.get("last_errors") or []
-    arr.append(f"{now_unix()}: {msg}")
-    state["last_errors"] = arr[-MAX_ERRORS:]
-
-
-def auth_ok(token: str) -> bool:
-    return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
-
-
-# =========================
-# STEAM API (Ranked matches + details)
-# =========================
-async def steam_get_match_history(account_id: str, matches_requested: int = 15) -> dict:
-    params = {
-        "key": STEAM_API_KEY,
-        "account_id": account_id,
-        "matches_requested": matches_requested,
-        "lobby_type": 7,  # ranked
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(STEAM_MATCH_HISTORY, params=params)
-        r.raise_for_status()
-        return r.json()
-
-
-async def steam_get_match_details(match_id: int) -> dict:
-    params = {
-        "key": STEAM_API_KEY,
-        "match_id": str(match_id),
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(STEAM_MATCH_DETAILS, params=params)
-        # иногда Steam может отдавать 500/503 — делаем простейший retry
-        if r.status_code >= 500:
-            await asyncio_sleep(1.2)
-            r = await client.get(STEAM_MATCH_DETAILS, params=params)
-        r.raise_for_status()
-        return r.json()
-
-
 def is_win_for_player(radiant_win: bool, player_slot: int) -> bool:
+    # player_slot < 128 => radiant
     is_radiant = int(player_slot) < 128
     return bool(radiant_win) if is_radiant else (not bool(radiant_win))
 
 
-async def asyncio_sleep(seconds: float):
-    # без импорта asyncio сверху — чтобы файл был короче
-    import asyncio
-    await asyncio.sleep(seconds)
+def clamp_pending(st: Dict[str, Any]) -> None:
+    pending = st.get("pending", {})
+    if not isinstance(pending, dict):
+        st["pending"] = {}
+        return
+    # keep only newest by start_time
+    if len(pending) <= MAX_PENDING:
+        return
+    items = []
+    for mid_str, meta in pending.items():
+        try:
+            stt = int(meta.get("start_time", 0))
+        except Exception:
+            stt = 0
+        items.append((mid_str, stt))
+    items.sort(key=lambda x: x[1], reverse=True)
+    keep = dict(items[:MAX_PENDING])
+    st["pending"] = {k: pending[k] for k in keep.keys()}
 
 
-async def apply_new_stream_matches(state: dict) -> Tuple[int, int, int]:
+def clamp_processed(st: Dict[str, Any]) -> None:
+    arr = st.get("processed_ids_stream", [])
+    if not isinstance(arr, list):
+        st["processed_ids_stream"] = []
+        return
+    st["processed_ids_stream"] = arr[-MAX_PROCESSED_STREAM:]
+
+
+# -----------------------
+# VALVE API
+# -----------------------
+async def valve_get_match_history(limit: int = 20) -> List[Dict[str, Any]]:
+    if not STEAM_API_KEY:
+        raise RuntimeError("STEAM_API_KEY not set")
+    if not ACCOUNT_ID:
+        raise RuntimeError("DOTA_ACCOUNT_ID not set")
+
+    params = {
+        "key": STEAM_API_KEY,
+        "account_id": int(ACCOUNT_ID),
+        "matches_requested": int(limit),
+        "lobby_type": 7,  # ranked
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(VALVE_HISTORY_URL, params=params)
+        r.raise_for_status()
+        data = r.json() or {}
+        res = data.get("result") or {}
+        matches = res.get("matches") or []
+        return matches
+
+
+async def valve_get_match_details(match_id: int) -> Dict[str, Any]:
+    if not STEAM_API_KEY:
+        raise RuntimeError("STEAM_API_KEY not set")
+
+    params = {
+        "key": STEAM_API_KEY,
+        "match_id": int(match_id),
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(VALVE_DETAILS_URL, params=params)
+
+        # Часто бывает 500 — это и есть наша проблема
+        if r.status_code >= 500:
+            raise httpx.HTTPStatusError("Valve details 5xx", request=r.request, response=r)
+
+        r.raise_for_status()
+        data = r.json() or {}
+        res = data.get("result") or {}
+        return res
+
+
+# -----------------------
+# CORE: PROCESS MATCHES
+# -----------------------
+async def process_stream_matches(st: Dict[str, Any]) -> Tuple[int, int]:
     """
-    Считает новые ranked матчи, которые начались >= stream_start_time.
-    Возвращает (added, wins, loses)
+    Returns: (processed_ok_count, pending_added_or_retried_count)
     """
-    if not state.get("stream_active"):
-        return (0, 0, 0)
+    if not st.get("stream_active"):
+        return (0, 0)
 
-    stream_start = int(state.get("stream_start_time", 0))
+    stream_start = int(st.get("stream_start_time", 0))
     if stream_start <= 0:
-        return (0, 0, 0)
+        return (0, 0)
 
-    processed = set(state.get("processed_ids_stream", []) or [])
+    processed = set(int(x) for x in (st.get("processed_ids_stream") or []))
+    pending: Dict[str, Any] = st.get("pending", {}) if isinstance(st.get("pending"), dict) else {}
 
-    history = await steam_get_match_history(DOTA_ACCOUNT_ID, matches_requested=30)
-    result = history.get("result", {})
-    matches = result.get("matches", []) or []
+    now = now_ts()
+    ok = 0
+    pend_work = 0
 
-    # отбираем ranked матчи после старта стрима
+    # 1) First retry pending that are due
+    due_ids = []
+    for mid_str, meta in pending.items():
+        try:
+            mid = int(mid_str)
+            next_try = int(meta.get("next_try", 0))
+        except Exception:
+            continue
+        if next_try <= now:
+            due_ids.append(mid)
+
+    for mid in due_ids:
+        meta = pending.get(str(mid), {})
+        try:
+            details = await valve_get_match_details(mid)
+            radiant_win = bool(details.get("radiant_win"))
+            # find player_slot for our account
+            player_slot = None
+            for p in (details.get("players") or []):
+                if int(p.get("account_id", -1)) == int(ACCOUNT_ID):
+                    player_slot = int(p.get("player_slot"))
+                    break
+            if player_slot is None:
+                push_error(st, f"{now}: details ok but player not found match_id={mid}")
+                # mark as processed to avoid infinite loop
+                processed.add(mid)
+                pending.pop(str(mid), None)
+                ok += 1
+                continue
+
+            won = is_win_for_player(radiant_win, player_slot)
+            delta = MMR_STEP if won else -MMR_STEP
+
+            st["mmr"] = int(st.get("mmr", START_MMR)) + delta
+            if won:
+                st["stream_win"] = int(st.get("stream_win", 0)) + 1
+            else:
+                st["stream_lose"] = int(st.get("stream_lose", 0)) + 1
+            st["stream_delta"] = int(st.get("stream_delta", 0)) + delta
+
+            processed.add(mid)
+            pending.pop(str(mid), None)
+            ok += 1
+        except Exception as e:
+            # keep pending with backoff
+            attempts = int(meta.get("attempts", 0)) + 1
+            backoff = min(DETAILS_BACKOFF_MAX, DETAILS_BACKOFF_BASE * (2 ** min(attempts, 8)))
+            pending[str(mid)] = {
+                **meta,
+                "attempts": attempts,
+                "next_try": now + backoff,
+            }
+            push_error(st, f"{now}: details retry failed match_id={mid} attempts={attempts} err={type(e).__name__}")
+            pend_work += 1
+
+            if attempts >= DETAILS_MAX_ATTEMPTS:
+                # give up but do not break whole bot; mark processed to stop spam
+                processed.add(mid)
+                pending.pop(str(mid), None)
+                push_error(st, f"{now}: details GIVE UP match_id={mid} after {attempts} attempts")
+                ok += 1
+
+    # 2) Fetch recent match history and enqueue new matches after stream start
+    try:
+        matches = await valve_get_match_history(limit=25)
+    except Exception as e:
+        push_error(st, f"{now}: history error err={type(e).__name__}")
+        # still return (we might have processed some pending)
+        st["processed_ids_stream"] = list(processed)
+        st["pending"] = pending
+        clamp_processed(st)
+        clamp_pending(st)
+        return (ok, pend_work)
+
+    # choose candidates: start_time >= stream_start, ranked, not processed, not pending
     candidates = []
     for m in matches:
         mid = m.get("match_id")
-        st = m.get("start_time")
+        stt = m.get("start_time")
         lobby_type = m.get("lobby_type")
-        if not mid or not st:
-            continue
-        if int(lobby_type or 0) != 7:
+
+        if not mid or not stt:
             continue
         mid = int(mid)
-        st = int(st)
-        if st >= stream_start and mid not in processed:
-            candidates.append((st, mid))
+        stt = int(stt)
+        if int(lobby_type or 0) != 7:
+            continue
+        if stt < stream_start:
+            continue
+        if mid in processed:
+            continue
+        if str(mid) in pending:
+            continue
+        candidates.append((stt, mid))
 
+    # sort old->new so stats apply in order
     candidates.sort(key=lambda x: x[0])
 
-    added = 0
-    wins = 0
-    loses = 0
-
-    for st, mid in candidates:
+    for stt, mid in candidates:
         try:
-            details = await steam_get_match_details(mid)
-            d = (details.get("result") or {})
-            # important fields
-            radiant_win = d.get("radiant_win", None)
-            players = d.get("players", []) or []
-            if radiant_win is None or not players:
-                push_error(state, f"details missing fields match_id={mid}")
-                continue
-
-            # find our player_slot
-            our_slot = None
-            for p in players:
-                if str(p.get("account_id")) == str(DOTA_ACCOUNT_ID):
-                    our_slot = p.get("player_slot")
+            details = await valve_get_match_details(mid)
+            radiant_win = bool(details.get("radiant_win"))
+            player_slot = None
+            for p in (details.get("players") or []):
+                if int(p.get("account_id", -1)) == int(ACCOUNT_ID):
+                    player_slot = int(p.get("player_slot"))
                     break
-            if our_slot is None:
-                push_error(state, f"no player_slot for account_id in match_id={mid}")
+            if player_slot is None:
+                push_error(st, f"{now}: details ok but player not found match_id={mid}")
+                processed.add(mid)
+                ok += 1
                 continue
 
-            won = is_win_for_player(bool(radiant_win), int(our_slot))
+            won = is_win_for_player(radiant_win, player_slot)
             delta = MMR_STEP if won else -MMR_STEP
 
-            state["mmr"] = int(state.get("mmr", START_MMR)) + delta
-
+            st["mmr"] = int(st.get("mmr", START_MMR)) + delta
             if won:
-                state["stream_win"] = int(state.get("stream_win", 0)) + 1
-                wins += 1
+                st["stream_win"] = int(st.get("stream_win", 0)) + 1
             else:
-                state["stream_lose"] = int(state.get("stream_lose", 0)) + 1
-                loses += 1
-
-            state["stream_delta"] = int(state.get("stream_delta", 0)) + delta
+                st["stream_lose"] = int(st.get("stream_lose", 0)) + 1
+            st["stream_delta"] = int(st.get("stream_delta", 0)) + delta
 
             processed.add(mid)
-            added += 1
+            ok += 1
 
-        except httpx.HTTPStatusError as e:
-            push_error(state, f"details HTTP error match_id={mid} status={e.response.status_code}")
         except Exception as e:
-            push_error(state, f"details error match_id={mid} err={type(e).__name__}")
+            # enqueue pending
+            pending[str(mid)] = {
+                "start_time": stt,
+                "attempts": 1,
+                "next_try": now + DETAILS_BACKOFF_BASE,
+            }
+            push_error(st, f"{now}: details enqueue pending match_id={mid} err={type(e).__name__}")
+            pend_work += 1
 
-    state["processed_ids_stream"] = list(processed)[-400:]
-    return (added, wins, loses)
+    st["processed_ids_stream"] = list(processed)
+    st["pending"] = pending
+    clamp_processed(st)
+    clamp_pending(st)
+    return (ok, pend_work)
 
 
-# =========================
-# TWITCH (EventSub)
-# =========================
-_twitch_app_token_cache = {"token": None, "exp": 0}
-
-
-async def twitch_get_app_token() -> str:
-    now = time.time()
-    if _twitch_app_token_cache["token"] and now < _twitch_app_token_cache["exp"]:
-        return _twitch_app_token_cache["token"]
-
-    params = {
-        "client_id": TWITCH_CLIENT_ID,
-        "client_secret": TWITCH_CLIENT_SECRET,
-        "grant_type": "client_credentials",
-    }
+# -----------------------
+# TWITCH EVENTSUB
+# -----------------------
+async def twitch_app_token() -> str:
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        raise RuntimeError("TWITCH_CLIENT_ID/SECRET not set")
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(TWITCH_TOKEN_URL, params=params)
+        r = await client.post(
+            "https://id.twitch.tv/oauth2/token",
+            params={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+        )
         r.raise_for_status()
-        data = r.json()
-        token = data.get("access_token")
-        expires_in = int(data.get("expires_in", 3600))
-        if not token:
-            raise RuntimeError("No Twitch app token returned")
-        _twitch_app_token_cache["token"] = token
-        _twitch_app_token_cache["exp"] = now + max(60, expires_in - 60)
-        return token
+        data = r.json() or {}
+        return data.get("access_token", "")
 
 
-async def twitch_get_user_id_by_login(login: str) -> str:
-    token = await twitch_get_app_token()
-    headers = {
-        "Client-ID": TWITCH_CLIENT_ID,
-        "Authorization": f"Bearer {token}",
-    }
+async def twitch_get_user_id(login: str, access_token: str) -> str:
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(TWITCH_USERS, headers=headers, params={"login": login})
+        r = await client.get(
+            "https://api.twitch.tv/helix/users",
+            params={"login": login},
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Client-Id": TWITCH_CLIENT_ID,
+            },
+        )
         r.raise_for_status()
-        data = r.json()
+        data = r.json() or {}
         arr = data.get("data") or []
         if not arr:
-            raise RuntimeError("Broadcaster login not found on Twitch")
-        return arr[0]["id"]
+            raise RuntimeError("Broadcaster not found")
+        return arr[0].get("id", "")
 
 
-async def twitch_list_subscriptions() -> dict:
-    token = await twitch_get_app_token()
-    headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"}
+async def twitch_list_subs(access_token: str) -> List[Dict[str, Any]]:
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(TWITCH_HELIX, headers=headers)
+        r = await client.get(
+            "https://api.twitch.tv/helix/eventsub/subscriptions",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Client-Id": TWITCH_CLIENT_ID,
+            },
+        )
         r.raise_for_status()
-        return r.json()
+        data = r.json() or {}
+        return data.get("data") or []
 
 
-async def twitch_create_subscription(sub_type: str, broadcaster_id: str) -> dict:
-    token = await twitch_get_app_token()
-    headers = {
-        "Client-ID": TWITCH_CLIENT_ID,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "type": sub_type,
+async def twitch_create_sub(access_token: str, broadcaster_id: str, typ: str) -> None:
+    # typ: stream.online / stream.offline
+    body = {
+        "type": typ,
         "version": "1",
         "condition": {"broadcaster_user_id": broadcaster_id},
         "transport": {
             "method": "webhook",
-            "callback": f"{APP_BASE_URL}/eventsub",
+            "callback": f"{PUBLIC_BASE_URL}/eventsub",
             "secret": EVENTSUB_SECRET,
         },
     }
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.post(TWITCH_HELIX, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            "https://api.twitch.tv/helix/eventsub/subscriptions",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Client-Id": TWITCH_CLIENT_ID,
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
         r.raise_for_status()
-        return r.json()
 
 
-def verify_eventsub_signature(headers: dict, body: bytes) -> bool:
-    # Twitch headers
-    msg_id = headers.get("Twitch-Eventsub-Message-Id", "")
-    msg_ts = headers.get("Twitch-Eventsub-Message-Timestamp", "")
-    sig = headers.get("Twitch-Eventsub-Message-Signature", "")
-    if not (msg_id and msg_ts and sig and EVENTSUB_SECRET):
+def verify_eventsub_signature(req: Request, body: bytes) -> bool:
+    msg_id = req.headers.get("Twitch-Eventsub-Message-Id", "")
+    msg_ts = req.headers.get("Twitch-Eventsub-Message-Timestamp", "")
+    sig = req.headers.get("Twitch-Eventsub-Message-Signature", "")
+    if not msg_id or not msg_ts or not sig:
+        return False
+    if not EVENTSUB_SECRET:
         return False
 
-    h = hmac.new(
-        EVENTSUB_SECRET.encode("utf-8"),
-        (msg_id + msg_ts).encode("utf-8") + body,
-        hashlib.sha256,
-    ).hexdigest()
-    expected = "sha256=" + h
+    message = (msg_id + msg_ts).encode("utf-8") + body
+    digest = hmac.new(EVENTSUB_SECRET.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    expected = f"sha256={digest}"
     return hmac.compare_digest(expected, sig)
 
 
-# =========================
+async def set_stream_active(active: bool, start_time: int = 0) -> None:
+    st = await redis_get_json(state_key()) or default_state()
+    st["stream_active"] = bool(active)
+    if active:
+        # start new stream session
+        st["stream_start_time"] = int(start_time) if start_time else now_ts()
+        st["stream_win"] = 0
+        st["stream_lose"] = 0
+        st["stream_delta"] = 0
+        st["processed_ids_stream"] = []
+        st["pending"] = {}
+        st["last_errors"] = []
+    await redis_set_json(state_key(), st)
+
+
+# -----------------------
 # ROUTES
-# =========================
+# -----------------------
 @app.get("/health", response_class=PlainTextResponse)
 async def health():
     return "ok"
@@ -370,264 +507,242 @@ async def mmr():
     if _cache_text and (now - _cache_ts) < CACHE_TTL:
         return _cache_text
 
-    # basic checks
-    if not DOTA_ACCOUNT_ID:
+    if not ACCOUNT_ID:
         return "DOTA_ACCOUNT_ID не установлен"
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return "Redis не настроен"
     if not STEAM_API_KEY:
         return "STEAM_API_KEY не установлен"
 
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key)
-    if not state:
-        state = default_state()
-        await redis_set_json(state_key, state)
+    st = await redis_get_json(state_key())
+    if not st:
+        st = default_state()
+        await redis_set_json(state_key(), st)
 
-    # если активный стрим — догоняем новые матчи
-    if state.get("stream_active"):
-        try:
-            await apply_new_stream_matches(state)
-        except httpx.HTTPStatusError as e:
-            push_error(state, f"history HTTP error status={e.response.status_code}")
-        except Exception as e:
-            push_error(state, f"history error err={type(e).__name__}")
+    # process matches if stream active
+    try:
+        await process_stream_matches(st)
+    except Exception as e:
+        push_error(st, f"{now_ts()}: process_stream_matches crash err={type(e).__name__}")
 
-    await redis_set_json(state_key, state)
+    await redis_set_json(state_key(), st)
 
-    cur = int(state.get("mmr", START_MMR))
-    sw = int(state.get("stream_win", 0)) if state.get("stream_active") else 0
-    sl = int(state.get("stream_lose", 0)) if state.get("stream_active") else 0
-    sd = int(state.get("stream_delta", 0)) if state.get("stream_active") else 0
+    cur = int(st.get("mmr", START_MMR))
+    tw = int(st.get("stream_win", 0))
+    tl = int(st.get("stream_lose", 0))
+    td = int(st.get("stream_delta", 0))
 
-    text = f"MMR: {cur} • Today -> Win: {sw} Lose: {sl} • Total: {fmt_signed(sd)}"
+    text = f"MMR: {cur} • Today -> Win: {tw} Lose: {tl} • Total: {fmt_signed(td)}"
     _cache_text, _cache_ts = text, now
     return text
 
 
 @app.get("/streamstatus", response_class=PlainTextResponse)
 async def streamstatus(token: str = Query("")):
-    if not auth_ok(token):
-        return "Forbidden"
+    admin_guard(token)
 
-    if not UPSTASH_URL or not UPSTASH_TOKEN:
-        return "Redis не настроен"
-    if not DOTA_ACCOUNT_ID:
-        return "DOTA_ACCOUNT_ID не установлен"
-
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key) or default_state()
-
-    lines = []
-    lines.append(f"account_id={DOTA_ACCOUNT_ID}")
-    lines.append(f"stream_active={state.get('stream_active')}")
-    lines.append(f"stream_start_time={state.get('stream_start_time')}")
-    lines.append(f"stream_win={state.get('stream_win')}")
-    lines.append(f"stream_lose={state.get('stream_lose')}")
-    lines.append(f"stream_delta={state.get('stream_delta')}")
-    lines.append(f"mmr={state.get('mmr')}")
-    lines.append(f"processed_ids_stream_count={len(state.get('processed_ids_stream') or [])}")
-
-    errs = state.get("last_errors") or []
-    if errs:
-        lines.append("\nlast_errors:")
-        for e in errs[-20:]:
-            lines.append(f"- {e}")
-
+    st = await redis_get_json(state_key()) or default_state()
+    lines = [
+        f"account_id={ACCOUNT_ID}",
+        f"stream_active={st.get('stream_active')}",
+        f"stream_start_time={st.get('stream_start_time')}",
+        f"stream_win={st.get('stream_win')}",
+        f"stream_lose={st.get('stream_lose')}",
+        f"stream_delta={st.get('stream_delta')}",
+        f"mmr={st.get('mmr')}",
+        f"processed_ids_stream_count={len(st.get('processed_ids_stream') or [])}",
+        f"pending_count={len((st.get('pending') or {}))}",
+        "",
+        "last_errors:",
+    ]
+    for e in (st.get("last_errors") or []):
+        lines.append(f"- {e}")
     return "\n".join(lines)
+
+
+@app.get("/debug_last_matches", response_class=PlainTextResponse)
+async def debug_last_matches(token: str = Query("")):
+    admin_guard(token)
+
+    st = await redis_get_json(state_key()) or default_state()
+
+    matches = await valve_get_match_history(limit=15)
+    lines = [
+        f"account_id={ACCOUNT_ID}",
+        f"got_matches={len(matches)}",
+        "last_15:",
+    ]
+    for m in matches:
+        lines.append(f"- match_id={m.get('match_id')} start_time={m.get('start_time')} lobby_type={m.get('lobby_type')}")
+    lines += [
+        "",
+        "state:",
+        f"stream_active={st.get('stream_active')}",
+        f"stream_start_time={st.get('stream_start_time')}",
+        f"processed_ids_stream_count={len(st.get('processed_ids_stream') or [])}",
+        f"pending_count={len(st.get('pending') or {})}",
+        f"mmr={st.get('mmr')}",
+    ]
+    return "\n".join(lines)
+
+
+@app.get("/debug_match", response_class=PlainTextResponse)
+async def debug_match(token: str = Query(""), match_id: int = Query(...)):
+    admin_guard(token)
+    try:
+        details = await valve_get_match_details(match_id)
+        # show minimal
+        radiant_win = details.get("radiant_win")
+        players = details.get("players") or []
+        slot = None
+        for p in players:
+            if int(p.get("account_id", -1)) == int(ACCOUNT_ID):
+                slot = p.get("player_slot")
+                break
+        return f"ok\nradiant_win={radiant_win}\nmy_player_slot={slot}\nplayers={len(players)}"
+    except httpx.HTTPStatusError as e:
+        return f"details_error: status={e.response.status_code}\n{e.response.text[:500]}"
+    except Exception as e:
+        return f"details_error: {type(e).__name__}: {str(e)[:300]}"
+
+
+@app.get("/stream_on", response_class=PlainTextResponse)
+async def stream_on(token: str = Query("")):
+    admin_guard(token)
+    await set_stream_active(True, now_ts())
+    return "ok: stream_active=True"
+
+
+@app.get("/stream_off", response_class=PlainTextResponse)
+async def stream_off(token: str = Query("")):
+    admin_guard(token)
+    st = await redis_get_json(state_key()) or default_state()
+    st["stream_active"] = False
+    await redis_set_json(state_key(), st)
+    return "ok: stream_active=False"
 
 
 @app.get("/reset_stream", response_class=PlainTextResponse)
 async def reset_stream(token: str = Query("")):
-    if not auth_ok(token):
-        return "Forbidden"
-
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key) or default_state()
-
-    # обнуляем только стрим-статы, mmr не трогаем
-    state["stream_win"] = 0
-    state["stream_lose"] = 0
-    state["stream_delta"] = 0
-    state["processed_ids_stream"] = []
-    state["stream_start_time"] = now_unix()
-    state["stream_active"] = True
-
-    await redis_set_json(state_key, state)
-    return "stream stats reset (mmr сохранён)"
-
-
-@app.get("/stream_backdate", response_class=PlainTextResponse)
-async def stream_backdate(token: str = Query(""), hours_ago: int = Query(7, ge=1, le=72)):
     """
-    Сдвигает stream_start_time назад на N часов, чтобы засчитать матчи,
-    сыгранные до того как EventSub поймал stream.online.
+    Reset ONLY stream counters (win/lose/delta) and rebase stream_start_time=now, keep mmr.
     """
-    if not auth_ok(token):
-        return "Forbidden"
-
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key) or default_state()
-
-    back_ts = now_unix() - int(hours_ago) * 3600
-
-    state["stream_active"] = True
-    state["stream_start_time"] = back_ts
-
-    # важно: очищаем processed, чтобы можно было пересчитать матчи "за стрим"
-    state["processed_ids_stream"] = []
-    state["stream_win"] = 0
-    state["stream_lose"] = 0
-    state["stream_delta"] = 0
-
-    await redis_set_json(state_key, state)
-    return f"ok: stream_start_time backdated by {hours_ago}h -> {back_ts}"
+    admin_guard(token)
+    st = await redis_get_json(state_key()) or default_state()
+    st["stream_start_time"] = now_ts()
+    st["stream_win"] = 0
+    st["stream_lose"] = 0
+    st["stream_delta"] = 0
+    st["processed_ids_stream"] = []
+    st["pending"] = {}
+    st["last_errors"] = []
+    st["stream_active"] = True
+    await redis_set_json(state_key(), st)
+    return "ok: reset_stream"
 
 
+@app.get("/reset_all", response_class=PlainTextResponse)
+async def reset_all(token: str = Query("")):
+    """
+    Full reset to START_MMR and clears everything.
+    """
+    admin_guard(token)
+    st = default_state()
+    await redis_set_json(state_key(), st)
+    return "ok: reset_all"
+
+
+# --- TEST endpoints (admin protected)
 @app.get("/testwin", response_class=PlainTextResponse)
-async def testwin(token: str = Query("")):
-    if not auth_ok(token):
-        return "Forbidden"
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key) or default_state()
-    state["mmr"] = int(state.get("mmr", START_MMR)) + MMR_STEP
-    state["stream_active"] = True
-    if int(state.get("stream_start_time", 0)) == 0:
-        state["stream_start_time"] = now_unix()
-    state["stream_win"] = int(state.get("stream_win", 0)) + 1
-    state["stream_delta"] = int(state.get("stream_delta", 0)) + MMR_STEP
-    await redis_set_json(state_key, state)
+async def test_win(token: str = Query("")):
+    admin_guard(token)
+    st = await redis_get_json(state_key()) or default_state()
+    st["mmr"] = int(st.get("mmr", START_MMR)) + MMR_STEP
+    st["stream_win"] = int(st.get("stream_win", 0)) + 1
+    st["stream_delta"] = int(st.get("stream_delta", 0)) + MMR_STEP
+    await redis_set_json(state_key(), st)
     return "WIN added"
 
 
 @app.get("/testlose", response_class=PlainTextResponse)
-async def testlose(token: str = Query("")):
-    if not auth_ok(token):
-        return "Forbidden"
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key) or default_state()
-    state["mmr"] = int(state.get("mmr", START_MMR)) - MMR_STEP
-    state["stream_active"] = True
-    if int(state.get("stream_start_time", 0)) == 0:
-        state["stream_start_time"] = now_unix()
-    state["stream_lose"] = int(state.get("stream_lose", 0)) + 1
-    state["stream_delta"] = int(state.get("stream_delta", 0)) - MMR_STEP
-    await redis_set_json(state_key, state)
+async def test_lose(token: str = Query("")):
+    admin_guard(token)
+    st = await redis_get_json(state_key()) or default_state()
+    st["mmr"] = int(st.get("mmr", START_MMR)) - MMR_STEP
+    st["stream_lose"] = int(st.get("stream_lose", 0)) + 1
+    st["stream_delta"] = int(st.get("stream_delta", 0)) - MMR_STEP
+    await redis_set_json(state_key(), st)
     return "LOSE added"
 
 
+# -----------------------
+# EVENTSUB SETUP + CALLBACK
+# -----------------------
 @app.get("/eventsub_setup", response_class=PlainTextResponse)
 async def eventsub_setup(token: str = Query("")):
-    if not auth_ok(token):
-        return "Forbidden"
+    admin_guard(token)
 
-    # checks
-    missing = []
-    if not TWITCH_CLIENT_ID: missing.append("TWITCH_CLIENT_ID")
-    if not TWITCH_CLIENT_SECRET: missing.append("TWITCH_CLIENT_SECRET")
-    if not TWITCH_BROADCASTER_LOGIN: missing.append("TWITCH_BROADCASTER_LOGIN")
-    if not EVENTSUB_SECRET: missing.append("EVENTSUB_SECRET")
-    if missing:
-        return "Missing env: " + ", ".join(missing)
+    if not EVENTSUB_SECRET:
+        return "EVENTSUB_SECRET not set"
+    if not TWITCH_BROADCASTER_LOGIN:
+        return "TWITCH_BROADCASTER_LOGIN not set"
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        return "TWITCH_CLIENT_ID/SECRET not set"
 
-    broadcaster_id = await twitch_get_user_id_by_login(TWITCH_BROADCASTER_LOGIN)
+    access = await twitch_app_token()
+    broadcaster_id = await twitch_get_user_id(TWITCH_BROADCASTER_LOGIN, access)
 
-    # list existing subs and create if missing
-    existing = await twitch_list_subscriptions()
-    data = existing.get("data") or []
+    subs = await twitch_list_subs(access)
+    have_online = any(s.get("type") == "stream.online" and (s.get("condition") or {}).get("broadcaster_user_id") == broadcaster_id for s in subs)
+    have_offline = any(s.get("type") == "stream.offline" and (s.get("condition") or {}).get("broadcaster_user_id") == broadcaster_id for s in subs)
 
-    def has_type(t: str) -> bool:
-        for s in data:
-            if s.get("type") == t and (s.get("condition") or {}).get("broadcaster_user_id") == broadcaster_id:
-                return True
-        return False
+    if not have_online:
+        await twitch_create_sub(access, broadcaster_id, "stream.online")
+    if not have_offline:
+        await twitch_create_sub(access, broadcaster_id, "stream.offline")
 
-    created = []
-    if not has_type("stream.online"):
-        await twitch_create_subscription("stream.online", broadcaster_id)
-        created.append("stream.online")
-    if not has_type("stream.offline"):
-        await twitch_create_subscription("stream.offline", broadcaster_id)
-        created.append("stream.offline")
-
-    lines = []
-    lines.append("ok")
-    lines.append(f"callback: {APP_BASE_URL}/eventsub")
-    lines.append(f"online: {'created' if 'stream.online' in created else 'exists'}")
-    lines.append(f"offline: {'created' if 'stream.offline' in created else 'exists'}")
-    return "\n".join(lines)
+    return "\n".join([
+        "ok",
+        f"callback: {PUBLIC_BASE_URL}/eventsub",
+        f"online: {'exists' if have_online else 'created'}",
+        f"offline: {'exists' if have_offline else 'created'}",
+    ])
 
 
-@app.post("/eventsub")
+@app.post("/eventsub", response_class=PlainTextResponse)
 async def eventsub(request: Request):
     body = await request.body()
 
+    # signature verify
+    if not verify_eventsub_signature(request, body):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
     msg_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
-    # 1) verification
+    data = json.loads(body.decode("utf-8") or "{}")
+
+    # verification
     if msg_type == "webhook_callback_verification":
-        data = await request.json()
         challenge = data.get("challenge", "")
-        return PlainTextResponse(challenge)
+        return challenge
 
-    # 2) signature verify
-    if not verify_eventsub_signature(dict(request.headers), body):
-        raise HTTPException(status_code=403, detail="bad signature")
-
-    # 3) notification
+    # notifications
     if msg_type == "notification":
-        payload = await request.json()
-        sub = payload.get("subscription") or {}
-        ev = payload.get("event") or {}
-        sub_type = sub.get("type")
+        sub = data.get("subscription") or {}
+        typ = sub.get("type", "")
+        event = data.get("event") or {}
 
-        state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-        state = await redis_get_json(state_key) or default_state()
+        if typ == "stream.online":
+            # start stream now (use current server time)
+            await set_stream_active(True, now_ts())
+            return "ok"
 
-        if sub_type == "stream.online":
-            # если стрим уже был “по факту” начат раньше, но событие пришло сейчас — позже сделаем backdate ручкой
-            state["stream_active"] = True
-            if not state.get("stream_start_time"):
-                state["stream_start_time"] = now_unix()
-            # обнуляем stats на новый стрим
-            state["stream_win"] = 0
-            state["stream_lose"] = 0
-            state["stream_delta"] = 0
-            state["processed_ids_stream"] = []
+        if typ == "stream.offline":
+            st = await redis_get_json(state_key()) or default_state()
+            st["stream_active"] = False
+            await redis_set_json(state_key(), st)
+            return "ok"
 
-        elif sub_type == "stream.offline":
-            state["stream_active"] = False
+        return "ok"
 
-        await redis_set_json(state_key, state)
-
-    return PlainTextResponse("ok")
-
-
-# =========================
-# DEBUG (optional)
-# =========================
-@app.get("/debug_last_matches", response_class=PlainTextResponse)
-async def debug_last_matches(token: str = Query("")):
-    if not auth_ok(token):
-        return "Forbidden"
-
-    state_key = f"mmr:{DOTA_ACCOUNT_ID}"
-    state = await redis_get_json(state_key) or default_state()
-
-    history = await steam_get_match_history(DOTA_ACCOUNT_ID, matches_requested=15)
-    result = history.get("result", {})
-    matches = result.get("matches", []) or []
-
-    lines = []
-    lines.append(f"account_id={DOTA_ACCOUNT_ID}")
-    lines.append(f"got_matches={len(matches)}")
-    lines.append("last_15:")
-    for m in matches:
-        lines.append(f"- match_id={m.get('match_id')} start_time={m.get('start_time')} lobby_type={m.get('lobby_type')}")
-
-    lines.append("\nstate:")
-    lines.append(f"stream_active={state.get('stream_active')}")
-    lines.append(f"stream_start_time={state.get('stream_start_time')}")
-    lines.append(f"processed_ids_stream_count={len(state.get('processed_ids_stream') or [])}")
-    lines.append(f"mmr={state.get('mmr')}")
-
-    return "\n".join(lines)
+    # revocation or others
+    return "ok"
