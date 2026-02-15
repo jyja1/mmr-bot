@@ -24,6 +24,9 @@ app = FastAPI()
 _cache_text = None
 _cache_ts = 0
 
+from fastapi import Query
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 def tz_msk():
     return timezone(timedelta(hours=TZ_OFFSET_HOURS))
@@ -192,6 +195,12 @@ async def mmr():
     return text
 
 @app.get("/testwin", response_class=PlainTextResponse)
+async def test_win(token: str = Query("")):
+    if token != ADMIN_TOKEN:
+        return "Forbidden"
+    # дальше твой код без изменений
+
+@app.get("/testwin", response_class=PlainTextResponse)
 async def test_win():
     state_key = f"mmr:{ACCOUNT_ID}"
     state = await redis_get_json(state_key)
@@ -206,6 +215,11 @@ async def test_win():
 
     return "WIN added"
 
+@app.get("/testlose", response_class=PlainTextResponse)
+async def test_lose(token: str = Query("")):
+    if token != ADMIN_TOKEN:
+        return "Forbidden"
+    # дальше твой код без изменений
 
 @app.get("/testlose", response_class=PlainTextResponse)
 async def test_lose():
@@ -221,6 +235,12 @@ async def test_lose():
     await redis_set_json(state_key, state)
 
     return "LOSE added"
+
+@app.get("/reset", response_class=PlainTextResponse)
+async def reset_state(token: str = Query("")):
+    if token != ADMIN_TOKEN:
+        return "Forbidden"
+    # дальше код reset
 
 @app.get("/reset", response_class=PlainTextResponse)
 async def reset_state():
