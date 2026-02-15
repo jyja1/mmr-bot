@@ -237,18 +237,19 @@ async def test_lose():
     return "LOSE added"
 
 @app.get("/reset", response_class=PlainTextResponse)
-async def reset_state(token: str = Query("")):
+async def reset(token: str = Query("")):
     if token != ADMIN_TOKEN:
         return "Forbidden"
-    # дальше код reset
 
-@app.get("/reset", response_class=PlainTextResponse)
-async def reset_state():
     state_key = f"mmr:{ACCOUNT_ID}"
-
     baseline = await fetch_latest_ranked_start_time()
     state = default_state(baseline)
 
     await redis_set_json(state_key, state)
+
+    # сброс кэша, чтобы /mmr сразу обновился
+    global _cache_text, _cache_ts
+    _cache_text = None
+    _cache_ts = 0
 
     return "State reset"
