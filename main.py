@@ -2,23 +2,22 @@ import os
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
+from fastapi import Query
 
-# ===== ENV =====
-ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")  # 32-bit dota account_id (не steam64)
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")
 
-START_MMR = int(os.environ.get("START_MMR", "13772"))ff
+START_MMR = int(os.environ.get("START_MMR", "13772"))
 MMR_STEP = int(os.environ.get("MMR_STEP", "25"))
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 OPENDOTA = "https://api.opendota.com/api"
 
 CACHE_TTL = 10  # сек кэш ответа /mmr
