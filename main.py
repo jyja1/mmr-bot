@@ -12,7 +12,7 @@ from fastapi.responses import PlainTextResponse
 ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")  # 32-bit dota account_id (не steam64)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-START_MMR = int(os.environ.get("START_MMR", "13772"))
+START_MMR = int(os.environ.get("START_MMR", "13772"))ff
 MMR_STEP = int(os.environ.get("MMR_STEP", "25"))
 TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 
@@ -242,7 +242,8 @@ async def reset(
     # считать от старого к новому
     used_sorted = sorted(used, key=lambda x: int(x.get("start_time", 0)))
 
-    mmr_val = START_MMR
+        mmr_val = START_MMR
+    # В reset считаем "Today" как "за init_last матчей", чтобы сразу показать результат
     today_w = 0
     today_l = 0
     today_d = 0
@@ -260,12 +261,14 @@ async def reset(
         processed_ids.append(mid)
         last_st = max(last_st, st)
 
-        if day_key_from_unix(st) == today_key():
-            if delta > 0:
-                today_w += 1
-            else:
-                today_l += 1
-            today_d += delta
+               # В reset считаем "Today" как статистику за init_last матчей
+        if delta > 0:
+            today_w += 1
+        else:
+            today_l += 1
+        today_d += delta
+
+
 
     state["mmr"] = mmr_val
     state["processed_ids"] = processed_ids
