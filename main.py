@@ -746,3 +746,16 @@ async def eventsub(request: Request):
 
     # revocation or others
     return "ok"
+
+@app.get("/set_stream_start", response_class=PlainTextResponse)
+async def set_stream_start(token: str = Query(""), ts: int = Query(0)):
+    if token != ADMIN_TOKEN:
+        return "Forbidden"
+
+    state = await get_state()
+    state["stream_active"] = True
+    state["stream_start_time"] = ts
+    state["processed_ids_stream"] = []
+    await save_state(state)
+
+    return f"stream_start_time set to {ts}"
