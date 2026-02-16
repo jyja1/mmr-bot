@@ -24,7 +24,7 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-# Twitch EventSub (stream.online/offline)
+# Twitch EventSub (stream.online/offline) + Helix fallback (auto-bootstrap)
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
 TWITCH_BROADCASTER_LOGIN = os.environ.get("TWITCH_BROADCASTER_LOGIN", "")  # e.g. debustie
@@ -56,6 +56,12 @@ def fmt_signed(n: int) -> str:
 
 def now_unix() -> int:
     return int(time.time())
+
+
+def clear_cache():
+    global _cache_text, _cache_ts
+    _cache_text = None
+    _cache_ts = 0.0
 
 
 def is_win_for_player(radiant_win: bool, player_slot: int) -> bool:
@@ -107,7 +113,7 @@ async def redis_set_json(key: str, obj: Dict[str, Any]):
 
 
 def default_state() -> Dict[str, Any]:
-    # stream_* = "текущий/последний стрим", сбрасывается на stream.online
+    # stream_* = окно текущего/последнего стрима. Сбрасывается на stream.online или ручной форс.
     return {
         "mmr": START_MMR,
 
@@ -141,14 +147,12 @@ def add_error(state: Dict[str, Any], msg: str):
 def get_public_base_url(request: Request) -> str:
     if PUBLIC_BASE_URL:
         return PUBLIC_BASE_URL
-    # Try derive from proxy headers
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
     return f"{proto}://{host}".rstrip("/")
 
 
-async def fetch_ranked_matches(account_id: str, limit: int = 30) -> List[Dict[str, Any]]:
-    # OpenDota player matches includes radiant_win + player_slot (good enough)
+async def fetch_ranked_matches(account_id: str, limit: int = 40) -> List[Dict[str, Any]]:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.get(
             f"{OPENDOTA}/players/{account_id}/matches",
@@ -169,7 +173,6 @@ def in_stream_window(st: int, start: int, end: int) -> bool:
         return False
     if end and end > 0:
         return start <= st <= end
-    # still active: allow >= start
     return st >= start
 
 
@@ -186,14 +189,11 @@ async def update_from_opendota(state: Dict[str, Any]) -> Dict[str, Any]:
     end = int(state.get("stream_end_time", 0) or 0)
 
     if start <= 0:
-        # no stream window defined yet => nothing to count
         return state
 
     matches = await fetch_ranked_matches(ACCOUNT_ID, limit=40)
-
     processed = set(state.get("processed_ids_stream", []) or [])
 
-    # collect candidates within stream window and not processed
     candidates = []
     for m in matches:
         mid = m.get("match_id")
@@ -208,29 +208,23 @@ async def update_from_opendota(state: Dict[str, Any]) -> Dict[str, Any]:
 
         if mid_i in processed:
             continue
-
         if not in_stream_window(st_i, start, end):
             continue
-
-        # must have these fields
         if m.get("radiant_win") is None or m.get("player_slot") is None:
             continue
 
         candidates.append(m)
 
-    # sort by time asc to keep stable order
     candidates.sort(key=lambda x: int(x.get("start_time", 0)))
 
     for m in candidates:
         mid = int(m["match_id"])
-        st = int(m["start_time"])
         radiant_win = bool(m["radiant_win"])
         player_slot = int(m["player_slot"])
 
         won = is_win_for_player(radiant_win, player_slot)
         delta = MMR_STEP if won else -MMR_STEP
 
-        # update totals
         state["mmr"] = int(state.get("mmr", START_MMR)) + delta
         if won:
             state["stream_win"] = int(state.get("stream_win", 0)) + 1
@@ -240,8 +234,122 @@ async def update_from_opendota(state: Dict[str, Any]) -> Dict[str, Any]:
 
         processed.add(mid)
 
-    # keep reasonable size
     state["processed_ids_stream"] = list(processed)[-400:]
+    return state
+
+
+# =========================
+# Twitch Helix fallback (auto-bootstrap)
+# =========================
+async def twitch_app_token() -> str:
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        raise HTTPException(status_code=500, detail="TWITCH_CLIENT_ID/SECRET not set")
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.post(
+            TWITCH_TOKEN_URL,
+            params={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        token = data.get("access_token")
+        if not token:
+            raise HTTPException(status_code=500, detail="Failed to get twitch app token")
+        return token
+
+
+async def twitch_get_user_id(login: str, access_token: str) -> str:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(
+            f"{TWITCH_API_BASE}/users",
+            params={"login": login},
+            headers={
+                "Client-Id": TWITCH_CLIENT_ID,
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        arr = data.get("data", [])
+        if not arr:
+            raise HTTPException(status_code=500, detail=f"Twitch user not found: {login}")
+        return arr[0]["id"]
+
+
+async def twitch_is_live_and_started_at(broadcaster_id: str, access_token: str) -> (bool, int):
+    """
+    Returns (is_live, started_at_unix)
+    """
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.get(
+            f"{TWITCH_API_BASE}/streams",
+            params={"user_id": broadcaster_id},
+            headers={
+                "Client-Id": TWITCH_CLIENT_ID,
+                "Authorization": f"Bearer {access_token}",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        arr = data.get("data", []) or []
+        if not arr:
+            return False, 0
+        started_at = arr[0].get("started_at")  # RFC3339
+        if started_at:
+            try:
+                dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                return True, int(dt.timestamp())
+            except Exception:
+                return True, 0
+        return True, 0
+
+
+async def maybe_bootstrap_stream_from_helix(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Если EventSub не успел прислать stream.online (стрим уже шёл),
+    то на /mmr мы один раз сами проверяем Helix:
+      - если сейчас LIVE и stream_active=False -> включаем стрим, ставим start_time=started_at, обнуляем счётчики
+      - если сейчас OFFLINE и stream_active=True -> выключаем (end_time=now)
+    """
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET or not TWITCH_BROADCASTER_LOGIN:
+        return state
+
+    try:
+        access_token = await twitch_app_token()
+
+        broadcaster_id = state.get("twitch_broadcaster_id", "") or ""
+        if not broadcaster_id:
+            broadcaster_id = await twitch_get_user_id(TWITCH_BROADCASTER_LOGIN, access_token)
+            state["twitch_broadcaster_id"] = broadcaster_id
+
+        is_live, started_at_unix = await twitch_is_live_and_started_at(broadcaster_id, access_token)
+
+        if is_live and not bool(state.get("stream_active", False)):
+            # авто-старт окна стрима
+            st = started_at_unix or now_unix()
+            state["stream_active"] = True
+            state["stream_start_time"] = st
+            state["stream_end_time"] = 0
+            state["stream_win"] = 0
+            state["stream_lose"] = 0
+            state["stream_delta"] = 0
+            state["processed_ids_stream"] = []
+            clear_cache()
+
+        if (not is_live) and bool(state.get("stream_active", False)):
+            # авто-стоп окна стрима
+            if int(state.get("stream_start_time", 0) or 0) > 0:
+                state["stream_end_time"] = now_unix()
+            state["stream_active"] = False
+            clear_cache()
+
+    except Exception as e:
+        add_error(state, f"helix_bootstrap_error: {type(e).__name__}: {e}")
+
     return state
 
 
@@ -272,12 +380,14 @@ async def mmr():
         state = default_state()
         await redis_set_json(key, state)
 
+    # Auto bootstrap from Twitch Helix (если стрим уже идёт)
+    state = await maybe_bootstrap_stream_from_helix(state)
+
     # update from OpenDota (counts only stream window)
     try:
         state = await update_from_opendota(state)
         await redis_set_json(key, state)
     except Exception as e:
-        # don't crash /mmr
         add_error(state, f"opendota_update_error: {type(e).__name__}: {e}")
         await redis_set_json(key, state)
 
@@ -319,6 +429,62 @@ async def streamstatus(token: str = Query("")):
     return "\n".join(lines)
 
 
+@app.get("/force_stream_on", response_class=PlainTextResponse)
+async def force_stream_on(
+    token: str = Query(""),
+    hours_ago: int = Query(0),
+    ts: int = Query(0),
+):
+    """
+    Ручной форс включения стрима + сброс счётчиков.
+    - ts=UNIX (приоритет)
+    - hours_ago=N -> start = now - N*3600
+    - иначе start = now
+    """
+    require_admin(token)
+
+    key = redis_key_state()
+    state = await redis_get_json(key) or default_state()
+
+    if ts and ts > 0:
+        start_ts = int(ts)
+    elif hours_ago and hours_ago > 0:
+        start_ts = now_unix() - int(hours_ago) * 3600
+    else:
+        start_ts = now_unix()
+
+    state["stream_active"] = True
+    state["stream_start_time"] = start_ts
+    state["stream_end_time"] = 0
+    state["stream_win"] = 0
+    state["stream_lose"] = 0
+    state["stream_delta"] = 0
+    state["processed_ids_stream"] = []
+    clear_cache()
+
+    await redis_set_json(key, state)
+    return f"OK force_stream_on start_time={start_ts}"
+
+
+@app.get("/force_stream_off", response_class=PlainTextResponse)
+async def force_stream_off(token: str = Query("")):
+    """
+    Ручной форс выключения стрима. Счётчики не сбрасывает, просто закрывает окно.
+    """
+    require_admin(token)
+
+    key = redis_key_state()
+    state = await redis_get_json(key) or default_state()
+
+    state["stream_active"] = False
+    if int(state.get("stream_start_time", 0) or 0) > 0:
+        state["stream_end_time"] = now_unix()
+    clear_cache()
+
+    await redis_set_json(key, state)
+    return f"OK force_stream_off end_time={state.get('stream_end_time', 0)}"
+
+
 @app.get("/reset", response_class=PlainTextResponse)
 async def reset(
     token: str = Query(""),
@@ -336,7 +502,6 @@ async def reset(
     if mode == "all":
         state = default_state()
     else:
-        # stream-only reset, keep mmr
         mmr_val = int(state.get("mmr", START_MMR))
         state["mmr"] = mmr_val
 
@@ -348,9 +513,7 @@ async def reset(
         state["stream_delta"] = 0
         state["processed_ids_stream"] = []
 
-        # keep twitch_broadcaster_id
-        # keep last_errors
-
+    clear_cache()
     await redis_set_json(key, state)
     return f"OK reset mode={mode} mmr={state.get('mmr')}"
 
@@ -372,45 +535,6 @@ def verify_eventsub_signature(secret: str, headers: Dict[str, str], body: bytes)
     mac.update(body)
     expected = "sha256=" + mac.hexdigest()
     return hmac.compare_digest(expected, sig)
-
-
-async def twitch_app_token() -> str:
-    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
-        raise HTTPException(status_code=500, detail="TWITCH_CLIENT_ID/SECRET not set")
-
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.post(
-            TWITCH_TOKEN_URL,
-            params={
-                "client_id": TWITCH_CLIENT_ID,
-                "client_secret": TWITCH_CLIENT_SECRET,
-                "grant_type": "client_credentials",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        token = data.get("access_token")
-        if not token:
-            raise HTTPException(status_code=500, detail="Failed to get twitch app token")
-        return token
-
-
-async def twitch_get_user_id(login: str, access_token: str) -> str:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(
-            f"{TWITCH_API_BASE}/users",
-            params={"login": login},
-            headers={
-                "Client-Id": TWITCH_CLIENT_ID,
-                "Authorization": f"Bearer {access_token}",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        arr = data.get("data", [])
-        if not arr:
-            raise HTTPException(status_code=500, detail=f"Twitch user not found: {login}")
-        return arr[0]["id"]
 
 
 async def twitch_list_subs(access_token: str) -> List[Dict[str, Any]]:
@@ -459,7 +583,6 @@ async def eventsub(request: Request):
 
     body = await request.body()
 
-    # Verify signature
     if not verify_eventsub_signature(EVENTSUB_SECRET, dict(request.headers), body):
         raise HTTPException(status_code=403, detail="Bad signature")
 
@@ -482,7 +605,6 @@ async def eventsub(request: Request):
 
     try:
         if typ == "stream.online":
-            # started_at exists for stream.online
             started_at = event.get("started_at")  # RFC3339
             st = 0
             if started_at:
@@ -503,13 +625,13 @@ async def eventsub(request: Request):
             state["stream_lose"] = 0
             state["stream_delta"] = 0
             state["processed_ids_stream"] = []
+            clear_cache()
 
         elif typ == "stream.offline":
-            # No ended_at in payload normally -> use now
             state["stream_active"] = False
-            # Keep start_time as-is, set end_time only if we had a stream
             if int(state.get("stream_start_time", 0) or 0) > 0:
                 state["stream_end_time"] = now_unix()
+            clear_cache()
 
         await redis_set_json(key, state)
     except Exception as e:
@@ -536,16 +658,20 @@ async def eventsub_setup(request: Request, token: str = Query("")):
     access_token = await twitch_app_token()
     broadcaster_id = await twitch_get_user_id(TWITCH_BROADCASTER_LOGIN, access_token)
 
-    # Save broadcaster id
     key = redis_key_state()
     state = await redis_get_json(key) or default_state()
     state["twitch_broadcaster_id"] = broadcaster_id
     await redis_set_json(key, state)
 
-    # Check existing subs
     subs = await twitch_list_subs(access_token)
-    have_online = any(s.get("type") == "stream.online" and s.get("condition", {}).get("broadcaster_user_id") == broadcaster_id for s in subs)
-    have_offline = any(s.get("type") == "stream.offline" and s.get("condition", {}).get("broadcaster_user_id") == broadcaster_id for s in subs)
+    have_online = any(
+        s.get("type") == "stream.online" and s.get("condition", {}).get("broadcaster_user_id") == broadcaster_id
+        for s in subs
+    )
+    have_offline = any(
+        s.get("type") == "stream.offline" and s.get("condition", {}).get("broadcaster_user_id") == broadcaster_id
+        for s in subs
+    )
 
     out = []
     out.append("ok")
