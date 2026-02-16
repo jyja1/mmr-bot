@@ -1,20 +1,16 @@
 import os
 import json
 import time
-from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, List, Tuple
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.responses import PlainTextResponse
 
-# =========================
-# ENV
-# =========================
-ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")  # 32-bit steam account id (например 1258333388)
-STEAM_API_KEY = os.environ.get("STEAM_API_KEY")
+# -------------------- ENV --------------------
+ACCOUNT_ID = os.environ.get("DOTA_ACCOUNT_ID")
 
 START_MMR = int(os.environ.get("START_MMR", "13772"))
 MMR_STEP = int(os.environ.get("MMR_STEP", "25"))
@@ -23,51 +19,47 @@ TZ_OFFSET_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "3"))
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 
-# Twitch EventSub (если используешь)
-TWITCH_BROADCASTER_LOGIN = os.environ.get("TWITCH_BROADCASTER_LOGIN", "")
-TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
-TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
-EVENTSUB_SECRET = os.environ.get("EVENTSUB_SECRET", "")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")  # optional
 
-CACHE_TTL = 10
+OPENDOTA = "https://api.opendota.com/api"
 
-STEAM_MATCH_HISTORY = "https://api.steampowered.com/IDOTA2Match_570/GetMatchHistory/V001/"
-STEAM_MATCH_DETAILS = "https://api.steampowered.com/IDOTA2Match_570/GetMatchDetails/V001/"
-TWITCH_OAUTH_TOKEN = "https://id.twitch.tv/oauth2/token"
-TWITCH_API_BASE = "https://api.twitch.tv/helix"
-TWITCH_EVENTSUB = f"{TWITCH_API_BASE}/eventsub/subscriptions"
+CACHE_TTL = 8  # seconds
 
+
+# -------------------- APP --------------------
 app = FastAPI()
-_cache_text = None
-_cache_ts = 0
+
+_cache_text: Optional[str] = None
+_cache_ts: float = 0.0
 
 
-# =========================
-# Helpers
-# =========================
+# -------------------- TIME HELPERS --------------------
 def tz_msk():
     return timezone(timedelta(hours=TZ_OFFSET_HOURS))
+
+
+def today_key() -> str:
+    return datetime.now(tz_msk()).strftime("%Y-%m-%d")
+
+
+def day_key_from_unix(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=tz_msk()).strftime("%Y-%m-%d")
 
 
 def fmt_signed(n: int) -> str:
     return f"+{n}" if n >= 0 else str(n)
 
 
-def now_unix() -> int:
-    return int(time.time())
+# -------------------- DOTA HELPERS --------------------
+def is_win_for_player(radiant_win: bool, player_slot: int) -> bool:
+    # In Dota, player_slot < 128 => Radiant, else Dire
+    is_radiant = int(player_slot) < 128
+    return bool(radiant_win) if is_radiant else (not bool(radiant_win))
 
 
-def admin_ok(token: str) -> bool:
-    return bool(ADMIN_TOKEN) and token == ADMIN_TOKEN
-
-
-def state_key() -> str:
-    # привязываем состояние строго к аккаунту
-    return f"mmr:{ACCOUNT_ID}"
-
-
-async def redis_get_json(key: str) -> Optional[dict]:
-    async with httpx.AsyncClient(timeout=15) as client:
+# -------------------- UPSTASH REDIS REST --------------------
+async def redis_get_json(key: str) -> Optional[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
             f"{UPSTASH_URL}/get/{key}",
             headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
@@ -80,9 +72,8 @@ async def redis_get_json(key: str) -> Optional[dict]:
         return json.loads(val)
 
 
-async def redis_set_json(key: str, obj: dict):
-    async with httpx.AsyncClient(timeout=15) as client:
-        # Upstash принимает raw value
+async def redis_set_json(key: str, obj: Dict[str, Any]) -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(
             f"{UPSTASH_URL}/set/{key}",
             headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
@@ -91,191 +82,127 @@ async def redis_set_json(key: str, obj: dict):
         r.raise_for_status()
 
 
-def default_state() -> dict:
-    return {
-        "start_mmr": START_MMR,
-        "mmr": START_MMR,
-
-        # Stream session
-        "stream_active": False,
-        "stream_start_time": 0,          # unix seconds
-        "stream_win": 0,
-        "stream_lose": 0,
-        "stream_delta": 0,
-        "processed_ids_stream": [],      # match ids already counted in stream
-
-        # debug / errors
-        "pending_ids": [],               # ids ждём (если матч уже в history, но details не готовы)
-        "last_errors": [],               # last 30 errors strings
-
-        "updated_at": now_unix(),
-    }
-
-
-async def get_state() -> dict:
-    st = await redis_get_json(state_key())
-    if not st:
-        st = default_state()
-        await redis_set_json(state_key(), st)
-    return st
-
-
-async def save_state(st: dict):
-    st["updated_at"] = now_unix()
-    await redis_set_json(state_key(), st)
-
-
-def push_error(st: dict, msg: str):
-    arr = st.get("last_errors", [])
-    arr.append(f"{now_unix()}: {msg}")
-    st["last_errors"] = arr[-30:]
-
-
-def is_win_for_player(radiant_win: bool, player_slot: int) -> bool:
-    # player_slot < 128 => radiant
-    is_radiant = int(player_slot) < 128
-    return bool(radiant_win) if is_radiant else (not bool(radiant_win))
-
-
-# =========================
-# Steam API
-# =========================
-async def steam_get_match_history(limit: int = 25) -> List[dict]:
-    params = {
-        "key": STEAM_API_KEY,
-        "account_id": int(ACCOUNT_ID),
-        "matches_requested": int(limit),
-        "lobby_type": 7,  # ranked matchmaking
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(STEAM_MATCH_HISTORY, params=params)
+# -------------------- OPENDOTA FETCH --------------------
+async def fetch_ranked_matches(limit: int = 30) -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{OPENDOTA}/players/{ACCOUNT_ID}/matches",
+            params={"lobby_type": 7, "limit": limit},  # 7 = Ranked
+        )
         r.raise_for_status()
-        data = r.json()
-    matches = (((data or {}).get("result") or {}).get("matches")) or []
-    return matches
+        return r.json() or []
 
 
-async def steam_get_match_details(match_id: int) -> Optional[dict]:
-    params = {
-        "key": STEAM_API_KEY,
-        "match_id": int(match_id),
-    }
-    async with httpx.AsyncClient(timeout=25) as client:
-        r = await client.get(STEAM_MATCH_DETAILS, params=params)
-        # бывает: 503/500 пока матч “не прогрузился”
-        if r.status_code != 200:
-            return {"_http_status": r.status_code, "_body": (r.text or "")[:500]}
-        data = r.json()
-    res = (data or {}).get("result")
-    return res
-
-
-def find_player_in_details(details: dict) -> Optional[dict]:
-    players = details.get("players") or []
-    aid = int(ACCOUNT_ID)
-    for p in players:
-        if int(p.get("account_id") or 0) == aid:
-            return p
-    return None
-
-
-# =========================
-# Core logic: update stream stats
-# =========================
-async def update_from_stream_matches(st: dict):
-    # если стрим не активен — ничего не считаем
-    if not st.get("stream_active"):
-        return
-
-    stream_start = int(st.get("stream_start_time", 0))
-    if stream_start <= 0:
-        return
-
-    # берём последние матчи ranked и фильтруем по start_time >= stream_start
-    matches = await steam_get_match_history(limit=25)
-
-    # кандидаты — матчи после старта стрима
-    candidates = []
+def normalize_matches_for_scoring(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Берем только те матчи, где есть всё нужное для win/lose:
+    match_id, start_time, radiant_win, player_slot
+    """
+    good = []
     for m in matches:
-        mid = int(m.get("match_id") or 0)
-        stime = int(m.get("start_time") or 0)
-        lobby_type = int(m.get("lobby_type") or 0)
-        if mid and stime and lobby_type == 7 and stime >= stream_start:
-            candidates.append({"match_id": mid, "start_time": stime})
+        mid = m.get("match_id")
+        st = m.get("start_time")
+        rw = m.get("radiant_win")
+        ps = m.get("player_slot")
+        if mid is None or st is None or rw is None or ps is None:
+            continue
+        good.append(m)
+    # OpenDota обычно дает по убыванию (свежее сверху), но на всякий:
+    good.sort(key=lambda x: int(x["start_time"]), reverse=True)
+    return good
 
-    candidates.sort(key=lambda x: x["start_time"])
 
-    processed = set(st.get("processed_ids_stream", []))
-    pending = set(st.get("pending_ids", []))
+# -------------------- STATE --------------------
+def default_state_from_last5(last5: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Инициализация: СЧИТАЕМ последние 5 ranked матчей сразу.
+    """
+    mmr = START_MMR
+    tw = tl = td = 0
 
-    for m in candidates:
+    processed_ids: List[int] = []
+    last_start_time = 0
+
+    # last5 идут от свежего к старому (мы их так отнормализовали),
+    # но для последовательности посчитаем от старого к свежему:
+    last5_sorted = sorted(last5, key=lambda x: int(x["start_time"]))
+
+    for m in last5_sorted:
+        st = int(m["start_time"])
         mid = int(m["match_id"])
-        if mid in processed:
-            continue
-
-        details = await steam_get_match_details(mid)
-
-        # если details не готовы / ошибка — в pending, попробуем позже
-        if not details or details.get("_http_status"):
-            status = (details or {}).get("_http_status")
-            push_error(st, f"steam details error match_id={mid} status={status}")
-            pending.add(mid)
-            continue
-
-        # иногда Steam возвращает result без нужных полей — тоже в pending
-        radiant_win = details.get("radiant_win")
-        if radiant_win is None:
-            push_error(st, f"steam details missing radiant_win match_id={mid}")
-            pending.add(mid)
-            continue
-
-        player = find_player_in_details(details)
-        if not player:
-            # если вдруг матч не содержит аккаунта — пропускаем
-            push_error(st, f"player not found in details match_id={mid}")
-            processed.add(mid)
-            continue
-
-        player_slot = player.get("player_slot")
-        if player_slot is None:
-            push_error(st, f"missing player_slot match_id={mid}")
-            pending.add(mid)
-            continue
-
-        won = is_win_for_player(bool(radiant_win), int(player_slot))
+        won = is_win_for_player(bool(m["radiant_win"]), int(m["player_slot"]))
         delta = MMR_STEP if won else -MMR_STEP
 
-        # общий mmr всегда копится
-        st["mmr"] = int(st.get("mmr", START_MMR)) + delta
+        mmr += delta
 
-        # стримовые счетчики
-        if won:
-            st["stream_win"] = int(st.get("stream_win", 0)) + 1
-        else:
-            st["stream_lose"] = int(st.get("stream_lose", 0)) + 1
-        st["stream_delta"] = int(st.get("stream_delta", 0)) + delta
+        # Today stats (по МСК)
+        if day_key_from_unix(st) == today_key():
+            if won:
+                tw += 1
+            else:
+                tl += 1
+            td += delta
 
-        processed.add(mid)
-        if mid in pending:
-            pending.remove(mid)
+        processed_ids.append(mid)
+        last_start_time = max(last_start_time, st)
 
-    # сохраняем
-    st["processed_ids_stream"] = list(processed)[-500:]
-    st["pending_ids"] = list(pending)[-200:]
+    return {
+        "start_mmr": START_MMR,
+        "mmr": mmr,
+        "last_start_time": last_start_time,
+        "processed_ids": processed_ids[-200:],
+        "today_date": today_key(),
+        "today_win": tw,
+        "today_lose": tl,
+        "today_delta": td,
+        # чтобы видеть, что реально инициализировали last5
+        "init_last5_count": len(last5_sorted),
+        "init_last5_last_start_time": last_start_time,
+    }
 
 
-# =========================
-# Endpoints
-# =========================
+async def load_or_init_state(state_key: str) -> Dict[str, Any]:
+    state = await redis_get_json(state_key)
+    if state:
+        return state
+
+    matches = await fetch_ranked_matches(limit=50)
+    good = normalize_matches_for_scoring(matches)
+    last5 = good[:5]
+
+    # если OpenDota не отдал нужных полей — просто создадим “пустую” базу
+    if len(last5) == 0:
+        return {
+            "start_mmr": START_MMR,
+            "mmr": START_MMR,
+            "last_start_time": 0,
+            "processed_ids": [],
+            "today_date": today_key(),
+            "today_win": 0,
+            "today_lose": 0,
+            "today_delta": 0,
+            "init_last5_count": 0,
+            "init_last5_last_start_time": 0,
+            "warning": "No scorable matches from OpenDota (missing radiant_win/player_slot?)",
+        }
+
+    state = default_state_from_last5(last5)
+    await redis_set_json(state_key, state)
+    return state
+
+
+def reset_today_if_needed(state: Dict[str, Any]) -> None:
+    if state.get("today_date") != today_key():
+        state["today_date"] = today_key()
+        state["today_win"] = 0
+        state["today_lose"] = 0
+        state["today_delta"] = 0
+
+
+# -------------------- ROUTES --------------------
 @app.get("/health", response_class=PlainTextResponse)
 async def health():
     return "ok"
-
-
-@app.head("/health")
-async def health_head():
-    # UptimeRobot free tier может слать HEAD
-    return PlainTextResponse("ok")
 
 
 @app.get("/mmr", response_class=PlainTextResponse)
@@ -286,210 +213,133 @@ async def mmr():
     if _cache_text and (now - _cache_ts) < CACHE_TTL:
         return _cache_text
 
-    # базовые проверки
     if not ACCOUNT_ID:
         return "DOTA_ACCOUNT_ID не установлен"
-    if not STEAM_API_KEY:
-        return "STEAM_API_KEY не установлен"
     if not UPSTASH_URL or not UPSTASH_TOKEN:
         return "Redis не настроен"
 
-    st = await get_state()
+    state_key = f"mmr:{ACCOUNT_ID}"
+    state = await load_or_init_state(state_key)
 
-    # обновляем по матчам стрима
-    try:
-        await update_from_stream_matches(st)
-    except Exception as e:
-        push_error(st, f"update exception: {type(e).__name__}: {e}")
+    reset_today_if_needed(state)
 
-    await save_state(st)
+    # догоняем новые матчи
+    matches = await fetch_ranked_matches(limit=50)
+    good = normalize_matches_for_scoring(matches)
 
-    cur = int(st.get("mmr", START_MMR))
-    sw = int(st.get("stream_win", 0))
-    sl = int(st.get("stream_lose", 0))
-    sd = int(st.get("stream_delta", 0))
+    processed = set(int(x) for x in state.get("processed_ids", []))
+    last_time = int(state.get("last_start_time", 0))
 
-    text = f"MMR: {cur} • Today -> Win: {sw} Lose: {sl} • Total: {fmt_signed(sd)}"
+    # новые матчи после last_start_time и не в processed
+    new_matches = []
+    for m in good:
+        st = int(m["start_time"])
+        mid = int(m["match_id"])
+        if st > last_time and mid not in processed:
+            new_matches.append(m)
+
+    # считаем по времени от старого к новому
+    new_matches.sort(key=lambda x: int(x["start_time"]))
+
+    for m in new_matches:
+        st = int(m["start_time"])
+        mid = int(m["match_id"])
+
+        won = is_win_for_player(bool(m["radiant_win"]), int(m["player_slot"]))
+        delta = MMR_STEP if won else -MMR_STEP
+
+        state["mmr"] = int(state.get("mmr", START_MMR)) + delta
+
+        if day_key_from_unix(st) == today_key():
+            if won:
+                state["today_win"] = int(state.get("today_win", 0)) + 1
+            else:
+                state["today_lose"] = int(state.get("today_lose", 0)) + 1
+            state["today_delta"] = int(state.get("today_delta", 0)) + delta
+
+        processed.add(mid)
+        state["last_start_time"] = max(int(state.get("last_start_time", 0)), st)
+
+    state["processed_ids"] = list(processed)[-200:]
+    await redis_set_json(state_key, state)
+
+    cur = int(state.get("mmr", START_MMR))
+    tw = int(state.get("today_win", 0))
+    tl = int(state.get("today_lose", 0))
+    td = int(state.get("today_delta", 0))
+
+    text = f"MMR: {cur} • Today -> Win: {tw} Lose: {tl} • Total: {fmt_signed(td)}"
     _cache_text, _cache_ts = text, now
     return text
 
 
-@app.get("/streamstatus", response_class=PlainTextResponse)
-async def streamstatus(token: str = Query("")):
-    if not admin_ok(token):
-        return "Forbidden"
-
-    st = await get_state()
-    lines = [
-        f"account_id={ACCOUNT_ID}",
-        f"stream_active={st.get('stream_active')}",
-        f"stream_start_time={st.get('stream_start_time')}",
-        f"stream_win={st.get('stream_win')}",
-        f"stream_lose={st.get('stream_lose')}",
-        f"stream_delta={st.get('stream_delta')}",
-        f"mmr={st.get('mmr')}",
-        f"processed_ids_stream_count={len(st.get('processed_ids_stream', []))}",
-        f"pending_count={len(st.get('pending_ids', []))}",
-        "",
-        "last_errors:",
-    ]
-    for e in st.get("last_errors", []):
-        lines.append(f"- {e}")
-    return "\n".join(lines)
-
-
-@app.get("/set_stream_start", response_class=PlainTextResponse)
-async def set_stream_start(token: str = Query(""), ts: int = Query(0)):
-    if not admin_ok(token):
-        return "Forbidden"
-    if ts <= 0:
-        return "ts must be unix seconds"
-
-    st = await get_state()
-    st["stream_active"] = True
-    st["stream_start_time"] = int(ts)
-    st["stream_win"] = 0
-    st["stream_lose"] = 0
-    st["stream_delta"] = 0
-    st["processed_ids_stream"] = []
-    st["pending_ids"] = []
-    st["last_errors"] = []
-    await save_state(st)
-
-    return f"ok\nstream_start_time={ts}"
-
-
-@app.get("/stream_on", response_class=PlainTextResponse)
-async def stream_on(token: str = Query(""), hours_ago: int = Query(0)):
+@app.get("/reset", response_class=PlainTextResponse)
+async def reset(token: str = Query("")):
     """
-    Включить стрим вручную.
-    Если hours_ago>0 — выставит stream_start_time = now - hours_ago*3600
+    Сбрасывает state и пересчитывает последние 5 ranked матчей заново.
     """
-    if not admin_ok(token):
-        return "Forbidden"
+    if ADMIN_TOKEN:
+        if token != ADMIN_TOKEN:
+            return "Forbidden"
 
-    st = await get_state()
-    st["stream_active"] = True
+    if not ACCOUNT_ID:
+        return "DOTA_ACCOUNT_ID не установлен"
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return "Redis не настроен"
 
-    if hours_ago > 0:
-        st["stream_start_time"] = now_unix() - int(hours_ago) * 3600
-    elif int(st.get("stream_start_time", 0)) <= 0:
-        st["stream_start_time"] = now_unix()
+    state_key = f"mmr:{ACCOUNT_ID}"
 
-    st["stream_win"] = 0
-    st["stream_lose"] = 0
-    st["stream_delta"] = 0
-    st["processed_ids_stream"] = []
-    st["pending_ids"] = []
-    st["last_errors"] = []
-    await save_state(st)
+    matches = await fetch_ranked_matches(limit=50)
+    good = normalize_matches_for_scoring(matches)
+    last5 = good[:5]
 
-    return f"ok\nstream_active=True\nstream_start_time={st['stream_start_time']}"
+    if len(last5) == 0:
+        state = {
+            "start_mmr": START_MMR,
+            "mmr": START_MMR,
+            "last_start_time": 0,
+            "processed_ids": [],
+            "today_date": today_key(),
+            "today_win": 0,
+            "today_lose": 0,
+            "today_delta": 0,
+            "init_last5_count": 0,
+            "init_last5_last_start_time": 0,
+            "warning": "No scorable matches from OpenDota (missing radiant_win/player_slot?)",
+        }
+    else:
+        state = default_state_from_last5(last5)
 
+    await redis_set_json(state_key, state)
 
-@app.get("/stream_off", response_class=PlainTextResponse)
-async def stream_off(token: str = Query("")):
-    if not admin_ok(token):
-        return "Forbidden"
+    # сброс кеша, чтобы сразу обновилось в чате
+    global _cache_text, _cache_ts
+    _cache_text, _cache_ts = None, 0.0
 
-    st = await get_state()
-    st["stream_active"] = False
-    await save_state(st)
-    return "ok\nstream_active=False"
-
-
-@app.get("/testwin", response_class=PlainTextResponse)
-async def testwin(token: str = Query("")):
-    if not admin_ok(token):
-        return "Forbidden"
-    st = await get_state()
-    st["mmr"] = int(st.get("mmr", START_MMR)) + MMR_STEP
-    st["stream_win"] = int(st.get("stream_win", 0)) + 1
-    st["stream_delta"] = int(st.get("stream_delta", 0)) + MMR_STEP
-    await save_state(st)
-    return "WIN added"
-
-
-@app.get("/testlose", response_class=PlainTextResponse)
-async def testlose(token: str = Query("")):
-    if not admin_ok(token):
-        return "Forbidden"
-    st = await get_state()
-    st["mmr"] = int(st.get("mmr", START_MMR)) - MMR_STEP
-    st["stream_lose"] = int(st.get("stream_lose", 0)) + 1
-    st["stream_delta"] = int(st.get("stream_delta", 0)) - MMR_STEP
-    await save_state(st)
-    return "LOSE added"
-
-
-@app.get("/reset_stream", response_class=PlainTextResponse)
-async def reset_stream(token: str = Query("")):
-    if not admin_ok(token):
-        return "Forbidden"
-    st = await get_state()
-    st["stream_win"] = 0
-    st["stream_lose"] = 0
-    st["stream_delta"] = 0
-    st["processed_ids_stream"] = []
-    st["pending_ids"] = []
-    st["last_errors"] = []
-    await save_state(st)
-    return "ok\nstream counters reset"
+    return f"OK reset. init_last5_count={state.get('init_last5_count')} last_start_time={state.get('last_start_time')}"
 
 
 @app.get("/debug_last_matches", response_class=PlainTextResponse)
 async def debug_last_matches(token: str = Query("")):
-    if not admin_ok(token):
+    """
+    Просто покажет последние 10 ranked из OpenDota и что в них есть.
+    """
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
         return "Forbidden"
 
-    matches = await steam_get_match_history(limit=15)
-    lines = [
-        f"account_id={ACCOUNT_ID}",
-        f"got_matches={len(matches)}",
-        "last_15:",
-    ]
-    for m in matches:
-        mid = m.get("match_id")
-        stime = m.get("start_time")
-        lobby_type = m.get("lobby_type")
-        lines.append(f"- match_id={mid} start_time={stime} lobby_type={lobby_type}")
+    if not ACCOUNT_ID:
+        return "DOTA_ACCOUNT_ID не установлен"
 
-    st = await get_state()
-    lines += [
-        "",
-        "state:",
-        f"stream_active={st.get('stream_active')}",
-        f"stream_start_time={st.get('stream_start_time')}",
-        f"processed_ids_stream_count={len(st.get('processed_ids_stream', []))}",
-        f"pending_count={len(st.get('pending_ids', []))}",
-        f"mmr={st.get('mmr')}",
-    ]
+    matches = await fetch_ranked_matches(limit=15)
+    good = normalize_matches_for_scoring(matches)
+
+    lines = []
+    lines.append(f"account_id={ACCOUNT_ID}")
+    lines.append(f"got_matches={len(matches)} scorable={len(good)}")
+    lines.append("last_10 (scorable):")
+    for m in good[:10]:
+        lines.append(
+            f"- match_id={m.get('match_id')} start_time={m.get('start_time')} "
+            f"radiant_win={m.get('radiant_win')} player_slot={m.get('player_slot')} lobby_type={m.get('lobby_type')}"
+        )
     return "\n".join(lines)
-
-
-# =========================
-# EventSub заглушки (если у тебя уже настроено — оставляем)
-# =========================
-@app.post("/eventsub")
-async def eventsub(request: Request):
-    """
-    Тут обычно принимают Twitch EventSub.
-    Сейчас оставляем как "не ломайся": просто 200.
-    Если у тебя уже есть рабочая логика — можешь вставить проверку подписи и обработку online/offline.
-    """
-    body = await request.body()
-    # ничего не делаем — чтобы не крашило
-    return PlainTextResponse("ok")
-
-
-@app.get("/eventsub_setup", response_class=PlainTextResponse)
-async def eventsub_setup(token: str = Query("")):
-    """
-    Оставляем как заглушку, чтобы не падало.
-    Реальная настройка EventSub требует OAuth app token и создания subscription.
-    """
-    if not admin_ok(token):
-        return "Forbidden"
-
-    # Просто подтверждаем callback, чтобы ты видел что эндпоинт живой.
-    return "ok\ncallback: https://mmr-bot.onrender.com/eventsub\nnote: setup via api is not implemented in this file"
